@@ -3,11 +3,11 @@
 Energy Optimizer — pyscript (HACS) — Strategic planning layer only.
 
 ╔══════════════════════════════════════════════════════════════════════════╗
-║  VERSION: 2026.06.10b (strategy layer)                                     ║
+║  VERSION: 2026.06.10c (strategy layer)                                     ║
 ║  Must be paired with tactical YAML of the SAME version. The two files form ║
 ║  one system: the strategy writes mode_id 0/1/2, the tactical YAML reads it.║
 ║  If the versions differ, redeploy BOTH and reload.                         ║
-║  (2026.06.10a/b change nothing in the tactical contract — mode IDs and     ║
+║  (2026.06.10a–c change nothing in the tactical contract — mode IDs and     ║
 ║  helper entities are unchanged — so the tactical YAML only needs its       ║
 ║  version string bumped to match.)                                          ║
 ║                                                                            ║
@@ -48,6 +48,19 @@ Energy Optimizer — pyscript (HACS) — Strategic planning layer only.
 ║               reads it like the EPEX attribute data). Exclude this sensor  ║
 ║               from the recorder — its attributes are ~15 kB every 15 min.  ║
 ║               No tactical/contract changes.                                ║
+║   2026.06.10c Quiet logging: routine per-cycle messages demoted to         ║
+║               DEBUG (re-enable via logger: custom_components.pyscript      ║
+║               .file.energy_optimizer: debug). Only the one-line cycle      ║
+║               summary, rare events (emergency/recovery/manual run/         ║
+║               daily finalize) and warnings/errors reach the HA log;        ║
+║               LOG_DEBUG defaults to False; the duplicated console          ║
+║               outlook table was removed (the md file IS the record).       ║
+║               Daily markdown rotation: per-day file renamed to             ║
+║               energy-optimizer-YYYY-MM-DD.md, refreshed intraday and       ║
+║               FINALIZED shortly after midnight as an executed-only         ║
+║               record of the full day; the live outlook restarts            ║
+║               fresh at the 00:00 cycle. Optional pruning via               ║
+║               HISTORY_RETENTION_DAYS. No tactical/contract changes.        ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 
 Runs every 15 minutes (and on EPEX price update events).
@@ -180,7 +193,7 @@ from scipy.optimize import linprog
 
 # Version of this strategy layer. Must match the tactical YAML's version.
 # Logged on every strategic run so the running version is visible in the log.
-VERSION = "2026.06.10b"
+VERSION = "2026.06.10c"
 
 USE_LP_OPTIMIZER = True
 
@@ -348,10 +361,28 @@ E_FORECAST_SENSOR = "sensor.energy_optimizer_forecast"
 def _history_json(day) -> str:
     return f"{HISTORY_DIR}/{day.strftime('%Y-%m-%d')}.json"
 
-def _history_md(day) -> str:
-    return f"{HISTORY_DIR}/{day.strftime('%Y-%m-%d')}.md"
+# 0 = keep daily files forever; N > 0 = delete daily .md/.json older than N
+# days during the nightly finalize run.
+HISTORY_RETENTION_DAYS = 0
 
-LOG_DEBUG = True
+def _history_md(day) -> str:
+    # Rotated daily markdown (2026.06.10c): energy-optimizer-YYYY-MM-DD.md.
+    # Refreshed on every strategic run during its day; overwritten once by
+    # midnight_finalize() the night after with the executed-only record.
+    return f"{HISTORY_DIR}/energy-optimizer-{day.strftime('%Y-%m-%d')}.md"
+
+# Logging (2026.06.10c): routine per-cycle messages are at DEBUG level and
+# hidden at HA's default log level. Only ONE info line per strategic cycle
+# (the decision summary "Mode=… | SOC=… | Price=… | LP=…"), rare events
+# (SOC emergency + recovery, manual run, daily finalize) and all warnings/
+# errors reach the HA log. To see everything again, add to configuration.yaml:
+#   logger:
+#     logs:
+#       custom_components.pyscript.file.energy_optimizer: debug
+# LOG_DEBUG additionally gates the VERY verbose data dumps (per-slot prices,
+# per-hour PV). Those are also at DEBUG level, so seeing them needs BOTH this
+# flag and the logger entry above.
+LOG_DEBUG = False
 
 # Timezone. Constructed LAZILY (not at module load) to avoid a blocking
 # zoneinfo file read inside the event loop during script load — Home Assistant
@@ -519,7 +550,7 @@ async def _fetch_historical_consumption(session: aiohttp.ClientSession) -> dict:
         result[k] = sorted_vals[idx]
 
     _ctx["cons_cache"] = {"day": today, "profile": result}
-    log.info(
+    log.debug(
         f"Consumption profile rebuilt: weekdays {weekdays_done}, "
         f"{len(result)} slots, q{int(CONSUMPTION_QUANTILE * 100)} (cached for today)"
     )
@@ -576,10 +607,10 @@ async def _get_solar_actuals(session: aiohttp.ClientSession) -> dict:
                 row[t_idx].replace("Z", "+00:00")
             ).astimezone(TZ)
             actuals[t_local.hour] = float(row[mean_idx])
-        log.info(f"PV actuals loaded: {len(actuals)} hours")
+        log.debug(f"PV actuals loaded: {len(actuals)} hours")
         if LOG_DEBUG:
             for h in sorted(actuals):
-                log.info(f"  pv actual {h:02d}:00 = {actuals[h]:.0f}W")
+                log.debug(f"  pv actual {h:02d}:00 = {actuals[h]:.0f}W")
     except Exception as exc:
         log.warning(f"PV actuals fetch error: {exc}")
     return actuals
@@ -645,7 +676,7 @@ def _get_solar_forecast(actuals: dict) -> dict:
             forecast[(today, h)] = w
         # NB: pyscript's interpreter has no generator expressions — use a list comp.
         n_today = len([k for k in forecast if k[0] == today])
-        log.info(f"Solcast today: {n_today} hours loaded")
+        log.debug(f"Solcast today: {n_today} hours loaded")
     except Exception as exc:
         log.warning(f"Solar today error: {exc}")
 
@@ -655,7 +686,7 @@ def _get_solar_forecast(actuals: dict) -> dict:
         parsed = _parse_hourly(fl, tomorrow)
         for h, w in parsed.items():
             forecast[(tomorrow, h)] = w
-        log.info(f"Solcast tomorrow: {len(parsed)} hours added")
+        log.debug(f"Solcast tomorrow: {len(parsed)} hours added")
     except Exception as exc:
         log.warning(f"Solar tomorrow error: {exc}")
 
@@ -670,9 +701,9 @@ def _get_solar_forecast(actuals: dict) -> dict:
     if comparison_hours:
         raw_scale = sum(comparison_hours) / len(comparison_hours)
         scale     = max(0.3, min(2.0, raw_scale))
-        log.info(f"PV scale factor: {scale:.2f} (raw {raw_scale:.2f}, {len(comparison_hours)} hours)")
+        log.debug(f"PV scale factor: {scale:.2f} (raw {raw_scale:.2f}, {len(comparison_hours)} hours)")
     else:
-        log.info("PV scale factor: no comparison hours, using 1.0")
+        log.debug("PV scale factor: no comparison hours, using 1.0")
 
     # Build solar keyed by absolute hour-truncated datetime across the horizon
     solar: dict = {}
@@ -696,13 +727,13 @@ def _get_solar_forecast(actuals: dict) -> dict:
 
         if solar:
             peak = max(solar, key=solar.get)
-            log.info(f"Solar blended: {len(solar)} hours, peak {solar[peak]:.0f}W at {peak:%H:%M}")
+            log.debug(f"Solar blended: {len(solar)} hours, peak {solar[peak]:.0f}W at {peak:%H:%M}")
             if LOG_DEBUG:
                 for k in sorted(solar):
                     if solar[k] > 0:
                         a_str = f" actual={actuals[k.hour]:.0f}W" if (k.date() == today and k.hour in actuals) else ""
                         f_str = f" fc={forecast.get((k.date(), k.hour), 0):.0f}W"
-                        log.info(f"  solar {k:%Y-%m-%d %H:%M} = {solar[k]:.0f}W{a_str}{f_str}")
+                        log.debug(f"  solar {k:%Y-%m-%d %H:%M} = {solar[k]:.0f}W{a_str}{f_str}")
         return solar
 
     # Scalar last-resort fallback
@@ -748,9 +779,9 @@ def _get_spot_prices() -> dict:
     try:
         raw_attrs = state.getattr(E_PRICE_DATA) or {}
         data      = raw_attrs.get("data", [])
-        log.info(f"EPEX data slots found: {len(data)}")
+        log.debug(f"EPEX data slots found: {len(data)}")
         if data:
-            log.info(f"EPEX first entry: {data[0]}")
+            log.debug(f"EPEX first entry: {data[0]}")
         for entry in data:
             t    = datetime.fromisoformat(entry["start_time"]).astimezone(TZ)
             epex = float(entry["price_per_kwh"])
@@ -800,7 +831,7 @@ def _build_schedule(consumption: dict, solar: dict, prices: dict) -> list:
     now    = now.replace(minute=minute, second=0, microsecond=0)
 
     horizon = _compute_horizon(now, solar, prices)
-    log.info(
+    log.debug(
         f"Planning horizon: {horizon} slots ({horizon*15/60:.1f}h) — "
         f"limited by the shortest of price/PV-forecast coverage."
     )
@@ -960,7 +991,7 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         tv_price = pv_floor
     tv_price = max(tv_price, pv_floor)
 
-    log.info(
+    log.debug(
         f"LP cost-optimizer: N={N} slots ({N*15/60:.1f}h)  "
         f"terminal={tv_price*100:.2f} ct/kWh (≥PV {PV_COST_CT:.1f}ct)  "
         f"prices p25={pq['p25']*100:.1f} p75={pq['p75']*100:.1f} ct  "
@@ -1110,7 +1141,7 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         e  = max(E_min_eff, min(E_max, e))
 
     soc_end = e / BATTERY_SIZE_WH * 100.0
-    log.info(
+    log.debug(
         f"LP solved ✓  slot-0={optimal[0]:+d}W  horizon_cost={total_cost:.4f}€  "
         f"SOC_end={soc_end:.0f}%"
     )
@@ -1159,7 +1190,7 @@ def _heuristic_schedule(soc: float, schedule: list) -> list:
     future_value   = _assess_future_value(schedule, p75)
     pv_recharge_wh = _estimate_pv_recharge(schedule, p75)
 
-    log.info(
+    log.debug(
         f"Heuristic: P25={p25 * 100:.1f} P75={p75 * 100:.1f} ct/kWh | "
         f"Future demand={future_value['high_demand_wh']:.0f}Wh | "
         f"PV recharge={pv_recharge_wh:.0f}Wh | "
@@ -1205,9 +1236,9 @@ def _heuristic_schedule(soc: float, schedule: list) -> list:
 
 def _get_schedule(soc: float, schedule: list) -> list:
     if USE_LP_OPTIMIZER:
-        log.info("Using LP optimizer")
+        log.debug("Using LP optimizer")
         return _solve_optimal_schedule(soc, schedule)
-    log.info("Using heuristic optimizer")
+    log.debug("Using heuristic optimizer")
     return _heuristic_schedule(soc, schedule)
 
 
@@ -1315,7 +1346,7 @@ def _write_outputs(mode: str, sp: int):
     mode_id = MODE_IDS.get(mode, 0)
     input_number.set_value(entity_id=E_MODE_ID,  value=mode_id)
     input_number.set_value(entity_id=E_SETPOINT, value=sp)
-    log.info(f"Output → mode_id={mode_id} ({mode}) setpoint={sp:+d}W")
+    log.debug(f"Output → mode_id={mode_id} ({mode}) setpoint={sp:+d}W")
 
 
 def _update_status(mode: str, reason: str):
@@ -1327,7 +1358,7 @@ def _update_status(mode: str, reason: str):
     label = mode_icons.get(mode, mode)
     input_text.set_value(entity_id=E_STATUS_MODE,   value=label)
     input_text.set_value(entity_id=E_STATUS_REASON, value=reason)
-    log.info(f"Status: {label} | {reason}")
+    log.debug(f"Status: {label} | {reason}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1446,16 +1477,133 @@ async def _mark_outlook_stale(msg: str):
             f"> {msg}\n"
         )
     if await _write_text_file(OUTLOOK_FILE, content):
-        log.info(f"Outlook marked stale: {msg}")
+        log.debug(f"Outlook marked stale: {msg}")
+
+
+def _slots_from_history(hist: dict, day_dt, qod_from: int, qod_to: int) -> list:
+    """Turn per-day history records (quarter-of-day keyed) into outlook slot
+    dicts, marked as executed (forecast=False). Shared by the live outlook
+    (today, 00:00 → now) and midnight_finalize (yesterday, full day)."""
+    out = []
+    for q in range(qod_from, qod_to):
+        rec = hist.get(str(q))
+        if not rec:
+            continue
+        hh, mm = divmod(q * 15, 60)
+        out.append({
+            "time":   day_dt.replace(hour=hh, minute=mm, second=0, microsecond=0),
+            "mode":   rec["mode"],
+            "reason": rec.get("reason", ""),
+            "forecast": False,
+            "price":  rec["price"],
+            "cons_w": rec["cons"],
+            "pv_w":   rec["pv"],
+            "batt_w": rec["batt"],
+            "grid_w": rec["grid"],
+            "soc_start_pct": rec["soc"],
+            "soc_pct": rec["soc"],
+        })
+    return out
+
+
+def _render_md_table(slots: list, header: str, now_hhmm) -> str:
+    """Render slot dicts as the strategy markdown table: contiguous windows
+    sharing (mode, forecast, reason), ✓-tagged executed rows, and — when
+    now_hhmm is given — a "now / forecast below" boundary before the first
+    forecast window. Used by the live outlook, the intraday daily file and
+    the finalized daily record (2026.06.10c refactor; the duplicated console
+    log table was dropped — the markdown file IS the record)."""
+
+    def _new_window(slot):
+        return {
+            "mode":     slot["mode"],
+            "reason":   slot["reason"],
+            "forecast": slot["forecast"],
+            "start":    slot["time"],
+            "prices":   [slot["price"]],
+            "cons_w":   [slot["cons_w"]],
+            "pv_w":     [slot["pv_w"]],
+            "batt_w":   [slot["batt_w"]],
+            "grid_w":   [slot["grid_w"]],
+            "soc_pct":  [slot["soc_pct"]],
+            "n_slots":   1,
+        }
+
+    def _same(slot, win):
+        return (slot["mode"] == win["mode"]
+                and slot["forecast"] == win["forecast"]
+                and slot["reason"] == win["reason"])
+
+    # Splitting on reason as well as mode keeps a long "HOLD" run from hiding a
+    # change in *why* (e.g. "PV covers load" → "holding for peak").
+    windows = []
+    cur = _new_window(slots[0])
+    for slot in slots[1:]:
+        if _same(slot, cur):
+            cur["prices"].append(slot["price"])
+            cur["cons_w"].append(slot["cons_w"])
+            cur["pv_w"].append(slot["pv_w"])
+            cur["batt_w"].append(slot["batt_w"])
+            cur["grid_w"].append(slot["grid_w"])
+            cur["soc_pct"].append(slot["soc_pct"])
+            cur["n_slots"] += 1
+        else:
+            cur["end"] = slot["time"]
+            windows.append(cur)
+            cur = _new_window(slot)
+    cur["end"] = cur["start"] + timedelta(minutes=15 * cur["n_slots"])
+    windows.append(cur)
+
+    def _avg(lst):
+        return sum(lst) / len(lst)
+
+    strategy_text = {
+        "FOLLOW_GRID": "🔋 FOLLOW_GRID",
+        "HOLD":        "⏸️ HOLD",
+        "GRID_CHARGE": "⚡ GRID_CHARGE",
+    }
+
+    md_lines = [header, ""]
+    md_lines.append("| Time | Strategy | Why | Price | Consumption | PV | Grid import | Batt setpoint | SOC end |")
+    md_lines.append("|------|----------|-----|-------|-------------|----|-------------|---------------|---------|")
+
+    boundary_drawn = False
+    for w in windows:
+        start_str = w["start"].strftime("%H:%M")
+        end_str   = w["end"].strftime("%H:%M")
+        duration  = w["n_slots"] * 15
+        strat     = strategy_text.get(w["mode"], w["mode"])
+        why       = w["reason"]
+        avg_price = _avg(w["prices"])
+        min_price = min(w["prices"]); max_price = max(w["prices"])
+        avg_cons  = _avg(w["cons_w"]); avg_pv = _avg(w["pv_w"])
+        avg_grid  = _avg(w["grid_w"]); avg_batt = _avg(w["batt_w"])
+        soc_end   = w["soc_pct"][-1]
+        avg_ct, min_ct, max_ct = avg_price*100, min_price*100, max_price*100
+        price_str = (
+            f"{avg_ct:.1f} ct" if abs(min_ct - max_ct) < 0.05
+            else f"{avg_ct:.1f} ct ({min_ct:.1f}–{max_ct:.1f})"
+        )
+        if now_hhmm and w["forecast"] and not boundary_drawn:
+            md_lines.append(f"| **— now ({now_hhmm}) · forecast below —** | | | | | | | | |")
+            boundary_drawn = True
+
+        tag = "" if w["forecast"] else "✓ "   # ✓ = actually executed
+        md_lines.append(
+            f"| {tag}`{start_str}–{end_str}` ({duration}min) "
+            f"| {strat} | {why} | {price_str} "
+            f"| {avg_cons:.0f} W | {avg_pv:.0f} W "
+            f"| {avg_grid:+.0f} W | {avg_batt:+.0f} W | {soc_end:.0f}% |"
+        )
+    return "\n".join(md_lines)
 
 
 async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float, session: aiohttp.ClientSession):
     if not schedule or not optimal_schedule:
-        log.info("Outlook: no schedule available")
+        log.debug("Outlook: no schedule available")
         await _mark_outlook_stale("No schedule available (missing price or PV data).")
         return
 
-    p75   = _ctx.get("p75", 0.20)
     DT    = 0.25
     E_now = soc / 100.0 * BATTERY_SIZE_WH
     E_min = BATTERY_EMPTY_PCT / 100.0 * BATTERY_SIZE_WH
@@ -1526,25 +1674,7 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float, s
     hist      = await _read_history(now_dt)
     if not isinstance(hist, dict):
         hist = {}
-    past_slots = []
-    for q in range(0, first_qod):
-        rec = hist.get(str(q))
-        if not rec:
-            continue
-        hh, mm = divmod(q * 15, 60)
-        past_slots.append({
-            "time":   now_dt.replace(hour=hh, minute=mm, second=0, microsecond=0),
-            "mode":   rec["mode"],
-            "reason": rec.get("reason", ""),
-            "forecast": False,
-            "price":  rec["price"],
-            "cons_w": rec["cons"],
-            "pv_w":   rec["pv"],
-            "batt_w": rec["batt"],
-            "grid_w": rec["grid"],
-            "soc_start_pct": rec["soc"],
-            "soc_pct": rec["soc"],
-        })
+    past_slots = _slots_from_history(hist, now_dt, 0, first_qod)
     slots = past_slots + slots
 
     # ── Publish the forecast as sensor attributes (2026.06.10b) ───────────
@@ -1577,142 +1707,36 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float, s
                 "data": attr_rows,
             },
         )
-        log.info(f"Forecast sensor published ({len(attr_rows)} rows)")
+        log.debug(f"Forecast sensor published ({len(attr_rows)} rows)")
     except Exception as exc:
         log.warning(f"Could not publish forecast sensor: {exc}")
 
-    # ── Aggregate into contiguous windows sharing (mode, forecast, reason) ──
-    # Splitting on reason as well as mode keeps a long "HOLD" run from hiding a
-    # change in *why* (e.g. "PV covers load" → "holding for peak").
-    def _new_window(slot):
-        return {
-            "mode":     slot["mode"],
-            "reason":   slot["reason"],
-            "forecast": slot["forecast"],
-            "start":    slot["time"],
-            "prices":   [slot["price"]],
-            "cons_w":   [slot["cons_w"]],
-            "pv_w":     [slot["pv_w"]],
-            "batt_w":   [slot["batt_w"]],
-            "grid_w":   [slot["grid_w"]],
-            "soc_pct":  [slot["soc_pct"]],
-            "n_slots":   1,
-        }
-
-    def _same(slot, win):
-        return (slot["mode"] == win["mode"]
-                and slot["forecast"] == win["forecast"]
-                and slot["reason"] == win["reason"])
-
-    windows = []
-    cur = _new_window(slots[0])
-    for slot in slots[1:]:
-        if _same(slot, cur):
-            cur["prices"].append(slot["price"])
-            cur["cons_w"].append(slot["cons_w"])
-            cur["pv_w"].append(slot["pv_w"])
-            cur["batt_w"].append(slot["batt_w"])
-            cur["grid_w"].append(slot["grid_w"])
-            cur["soc_pct"].append(slot["soc_pct"])
-            cur["n_slots"] += 1
-        else:
-            cur["end"] = slot["time"]
-            windows.append(cur)
-            cur = _new_window(slot)
-    cur["end"] = cur["start"] + timedelta(minutes=15 * cur["n_slots"])
-    windows.append(cur)
-
-    def _avg(lst):
-        return sum(lst) / len(lst)
-
-    # Strategy column: exactly one of the three strategies (no sub-labels).
-    strategy_text = {
-        "FOLLOW_GRID": "🔋 FOLLOW_GRID",
-        "HOLD":        "⏸️ HOLD",
-        "GRID_CHARGE": "⚡ GRID_CHARGE",
-    }
-
-    # Use the SAME now_dt computed above for the history/forecast split, so the
-    # "updated" timestamp in the header and the "— now —" boundary row can never
-    # disagree (avoids a one-minute skew when a run straddles a minute boundary).
-    now_str   = now_dt.strftime("%d.%m.%Y %H:%M")
-    log_lines = []
-    log_lines.append(
-        f"─── 24h Outlook ({'LP' if USE_LP_OPTIMIZER else 'Heuristic'}) | "
-        f"SOC {soc:.0f}% | "
-        f"P25={_ctx.get('p25', 0) * 100:.1f} "
-        f"P75={_ctx.get('p75', 0) * 100:.1f} ct/kWh ───"
-    )
-
-    md_lines = []
-    md_lines.append(
+    # ── Render + write the live outlook ───────────────────────────────────
+    # Same now_dt as the history/forecast split above, so the header timestamp
+    # and the "— now —" boundary row can never disagree.
+    now_str = now_dt.strftime("%d.%m.%Y %H:%M")
+    header = (
         f"**{'LP' if USE_LP_OPTIMIZER else 'Heuristic'} optimizer** | "
         f"SOC **{soc:.0f}%** | "
         f"P25 {_ctx.get('p25', 0) * 100:.1f} · "
         f"P75 {_ctx.get('p75', 0) * 100:.1f} ct/kWh "
         f"_(updated {now_str}, v{VERSION})_"
     )
-    md_lines.append("")
-    md_lines.append("| Time | Strategy | Why | Price | Consumption | PV | Grid import | Batt setpoint | SOC end |")
-    md_lines.append("|------|----------|-----|-------|-------------|----|-------------|---------------|---------|")
-
-    now_hhmm  = now_dt.strftime("%H:%M")
-    boundary_drawn = False
-    for w in windows:
-        start_str = w["start"].strftime("%H:%M")
-        end_str   = w["end"].strftime("%H:%M")
-        duration  = w["n_slots"] * 15
-        strat     = strategy_text.get(w["mode"], w["mode"])
-        why       = w["reason"]
-        avg_price = _avg(w["prices"])
-        min_price = min(w["prices"]); max_price = max(w["prices"])
-        avg_cons  = _avg(w["cons_w"]); avg_pv = _avg(w["pv_w"])
-        avg_grid  = _avg(w["grid_w"]); avg_batt = _avg(w["batt_w"])
-        soc_end   = w["soc_pct"][-1]
-        avg_ct, min_ct, max_ct = avg_price*100, min_price*100, max_price*100
-        price_str = (
-            f"{avg_ct:.1f} ct" if abs(min_ct - max_ct) < 0.05
-            else f"{avg_ct:.1f} ct ({min_ct:.1f}–{max_ct:.1f})"
-        )
-        # Mark the boundary between executed history and forecast once.
-        if w["forecast"] and not boundary_drawn:
-            md_lines.append(f"| **— now ({now_hhmm}) · forecast below —** | | | | | | | | |")
-            boundary_drawn = True
-
-        tag = "" if w["forecast"] else "✓ "   # ✓ = actually executed
-        log_lines.append(
-            f"  {tag}{start_str}–{end_str} ({duration:3d}min) "
-            f"{strat:<16} {why:<46} {price_str:<22} "
-            f"cons {avg_cons:.0f}W pv {avg_pv:.0f}W "
-            f"grid {avg_grid:+.0f}W batt {avg_batt:+.0f}W SOC→{soc_end:.0f}%"
-        )
-        md_lines.append(
-            f"| {tag}`{start_str}–{end_str}` ({duration}min) "
-            f"| {strat} | {why} | {price_str} "
-            f"| {avg_cons:.0f} W | {avg_pv:.0f} W "
-            f"| {avg_grid:+.0f} W | {avg_batt:+.0f} W | {soc_end:.0f}% |"
-        )
-
-    log_lines.append("────────────────────────────────────────────────────────────────")
-    if LOG_DEBUG:
-        for line in log_lines:
-            log.info(line)
-
-    # ── Write Markdown file ────────────────────────────────────────────────
-    content = "\n".join(md_lines)
+    content = _render_md_table(slots, header, now_dt.strftime("%H:%M"))
     if await _write_text_file(OUTLOOK_FILE, content):
-        log.info(f"Outlook written to {OUTLOOK_FILE} ({len(md_lines)} rows)")
+        log.debug(f"Outlook written to {OUTLOOK_FILE}")
 
-    # ── Write per-day archive  <HISTORY_DIR>/YYYY-MM-DD.md ─────────────────
-    # Same content (executed history 00:00→now + today's forecast tail). It is
-    # refreshed every run and is the complete record of the day once the day
-    # ends, since a new date starts a fresh file at midnight.
+    # ── Refresh today's rotated daily markdown (intraday view) ─────────────
+    # energy-optimizer-YYYY-MM-DD.md mirrors the live outlook during its day
+    # (executed history so far + remaining forecast). A NEW file starts with
+    # the first strategic run after 00:00; shortly after midnight,
+    # midnight_finalize() overwrites YESTERDAY's file once more with the
+    # executed-only record of the complete day, freezing it as the archive.
     try:
-        day_path = _history_md(now_dt)
-        if await _write_text_file(day_path, content):
-            log.info(f"Daily archive written to {day_path}")
+        if await _write_text_file(_history_md(now_dt), content):
+            log.debug(f"Daily markdown refreshed: {_history_md(now_dt)}")
     except Exception as exc:
-        log.warning(f"Could not write daily archive: {exc}")
+        log.warning(f"Could not write daily markdown: {exc}")
 
     # ── Write CSV forecast file ────────────────────────────────────────────
     try:
@@ -1738,7 +1762,7 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float, s
                 "soc_end_pct":   round(slot["soc_pct"], 1),
             })
         if await _write_text_file(FORECAST_CSV_FILE, buf.getvalue()):
-            log.info(f"Forecast CSV written to {FORECAST_CSV_FILE}")
+            log.debug(f"Forecast CSV written to {FORECAST_CSV_FILE}")
     except Exception as exc:
         log.warning(f"Could not write forecast CSV: {exc}")
 
@@ -1782,7 +1806,7 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float, s
             timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:
             if resp.status in (200, 204):
-                log.info(f"Forecast written to InfluxDB ({len(lines)} points)")
+                log.debug(f"Forecast written to InfluxDB ({len(lines)} points)")
             else:
                 text = await resp.text()
                 log.warning(f"InfluxDB write failed: {resp.status} {text}")
@@ -1804,7 +1828,7 @@ async def strategic_optimize():
     # newer run produces the fresh one, which is exactly what we want.)
     task.unique("energy_optimizer_strategic")
 
-    log.info(f"── Strategic cycle v{VERSION} ({'LP' if USE_LP_OPTIMIZER else 'Heuristic'}) ──")
+    log.debug(f"── Strategic cycle v{VERSION} ({'LP' if USE_LP_OPTIMIZER else 'Heuristic'}) ──")
     session = aiohttp.ClientSession()
     # Defined up-front so the finally-block outlook write is always safe, even if
     # the cycle raises before they are assigned.
@@ -1837,13 +1861,13 @@ async def strategic_optimize():
         prices      = _get_spot_prices()
 
         if LOG_DEBUG and prices:
-            log.info("── EPEX prices (incl. network fee) ──")
+            log.debug("── EPEX prices (incl. network fee) ──")
             # Keys are uniformly (date, hour, quarter) since 2026.06.10 — the
             # fallback curve is date-keyed too.
             for k, p in sorted(prices.items(), key=lambda kv: kv[0]):
                 d, h, q = k
-                log.info(f"  {d} {h:02d}:{q * 15:02d}  {p * 100:.3f} ct/kWh")
-            log.info("─────────────────────────────────────")
+                log.debug(f"  {d} {h:02d}:{q * 15:02d}  {p * 100:.3f} ct/kWh")
+            log.debug("─────────────────────────────────────")
 
         if not prices:
             skip_reason = "No price data available — cycle skipped."
@@ -1946,9 +1970,82 @@ async def strategic_optimize():
 # EVENT TRIGGERS
 # ════════════════════════════════════════════════════════════════════════════
 
+@pyscript_compile
+def _prune_history_blocking(directory: str, keep_days: int, today_ord: int) -> list:
+    """Delete daily history files (md + json, current and legacy naming) older
+    than keep_days. Compiled + run via task.executor (filesystem I/O)."""
+    import os, re, datetime
+    removed = []
+    pat = re.compile(r"(?:energy-optimizer-)?(\d{4})-(\d{2})-(\d{2})\.(?:md|json)$")
+    try:
+        names = os.listdir(directory)
+    except FileNotFoundError:
+        return removed
+    for n in names:
+        m = pat.fullmatch(n)
+        if not m:
+            continue
+        try:
+            d = datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            continue
+        if today_ord - d.toordinal() > keep_days:
+            try:
+                os.remove(os.path.join(directory, n))
+                removed.append(n)
+            except OSError:
+                pass
+    return removed
+
+
+@time_trigger("cron(1 0 * * *)")
+async def midnight_finalize():
+    """Daily markdown rotation (2026.06.10c), runs at 00:01.
+
+    The 00:00 strategic cycle already starts the NEW day's outlook and its new
+    energy-optimizer-<today>.md. This job then rewrites YESTERDAY's file one
+    last time from yesterday's executed-slot JSON: a pure record of what was
+    actually done 00:00–24:00 — all rows ✓, no leftover forecast tail and no
+    missing final slot (the intraday refresh could never show the 23:45 slot
+    as executed, because the next run after it already belongs to today).
+    Optionally prunes daily files older than HISTORY_RETENTION_DAYS."""
+    _ensure_tz()
+    now  = datetime.now(TZ)
+    yday = (now - timedelta(days=1)).date()
+    try:
+        hist = await _read_history(yday)
+        if hist:
+            y_dt  = datetime(yday.year, yday.month, yday.day, tzinfo=TZ)
+            slots = _slots_from_history(hist, y_dt, 0, 96)
+            if slots:
+                header = (
+                    f"**Daily record {yday.strftime('%d.%m.%Y')}** — "
+                    f"executed strategies "
+                    f"_(finalized {now.strftime('%d.%m.%Y %H:%M')}, v{VERSION})_"
+                )
+                content = _render_md_table(slots, header, None)
+                if await _write_text_file(_history_md(yday), content):
+                    log.info(f"Daily markdown finalized: {_history_md(yday)}")
+        else:
+            log.debug(f"No history for {yday} — nothing to finalize")
+    except Exception as exc:
+        log.warning(f"Midnight finalize failed: {exc}")
+
+    if HISTORY_RETENTION_DAYS > 0:
+        try:
+            removed = await task.executor(
+                _prune_history_blocking, HISTORY_DIR,
+                HISTORY_RETENTION_DAYS, now.date().toordinal(),
+            )
+            if removed:
+                log.debug(f"History pruned: {len(removed)} files removed")
+        except Exception as exc:
+            log.warning(f"History pruning failed: {exc}")
+
+
 @state_trigger(E_PRICE_DATA)
 async def on_price_update(**kwargs):
-    log.info("EPEX price data updated — triggering strategic cycle")
+    log.debug("EPEX price data updated — triggering strategic cycle")
     await strategic_optimize()
 
 
