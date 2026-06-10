@@ -1,0 +1,200 @@
+# Energy Overview — plotly-graph card, paired with energy_optimizer.py ≥ v2026.06.10b
+# (the dotted "planned" traces read sensor.energy_optimizer_forecast, which the
+#  strategy layer publishes every cycle; rows with forecast=true start at "now").
+#
+# Changes vs previous version:
+#   * FIX: "6h" range button actually selected 12 h (count 0.5 day) → 0.25.
+#   * FIX: "Now" line moved to the invisible, fixed y3 axis spanning −20…100,
+#     so it always covers the full plot height — it previously drew −1000…2500
+#     on y1, mismatching the −500…2500 axis and breaking if you rescale y1.
+#     Also gray instead of black (visible in dark themes), hover disabled.
+#   * FIX: removed `default: null` (not a card option — silently ignored).
+#   * EPEX price now drawn stepped (line.shape: hv — spot prices are piecewise
+#     constant; linear interpolation drew prices that never existed) and with
+#     the +10.5 ct network fee added so the curve is the price the optimizer
+#     actually optimises (matches NETWORK_FEE_CT_PER_KWH and the ct values in
+#     the optimizer's reason texts). Remove "+ 10.5" if you want raw EPEX.
+#   * Removed no-op identity filters (map_y_numbers: "y").
+#   * show_value on the power traces (texttemplates were dead without it).
+#   * period: auto on statistics traces, so the 1W/2W/1M range buttons don't
+#     fetch a month of 5-minute buckets.
+#   * NEW: dotted planned consumption, planned PV and planned SoC from
+#     sensor.energy_optimizer_forecast (stepped hv for the 15-min slot values).
+type: custom:plotly-graph
+time_offset: 1d
+refresh_interval: 15s
+hours_to_show: 48
+layout:
+  xaxis:
+    rangeselector:
+      "y": 1.2
+      buttons:
+        - count: 0.25
+          step: day
+          label: 6h
+        - count: 2
+          step: day
+          label: 2D
+        - count: 4
+          step: day
+          label: 4D
+        - count: 7
+          step: day
+          label: 1W
+        - count: 14
+          step: day
+          label: 2W
+        - count: 1
+          step: month
+          label: 1M
+  yaxis:
+    title:
+      text: Power (W)
+    tickformat: .0f
+    side: left
+    range:
+      - -500
+      - 2500
+    zeroline: true
+    zerolinecolor: "#888888"
+    zerolinewidth: 2
+  yaxis2:
+    title:
+      text: Price (ct/kWh)
+    tickformat: .1f
+    side: right
+    overlaying: "y"
+    range:
+      - -5
+      - 35
+    zeroline: true
+    zerolinecolor: "#444444"
+    zerolinewidth: 2
+    showgrid: false
+  yaxis3:
+    overlaying: "y"
+    visible: false
+    range:
+      - -20
+      - 100
+    fixedrange: true
+round: 2
+entities:
+  - entity: sensor.shrdzm_485519e15aae_16_7_0
+    name: Grid power (import +)
+    yaxis: y1
+    line:
+      color: deepskyblue
+      width: 2
+    statistic: mean
+    period: auto
+    show_value: true
+    texttemplate: " %{y:.0f} W"
+  - entity: sensor.ezhi_photovoltaic_power
+    name: PV Production
+    yaxis: y1
+    line:
+      color: rgba(255,255,0,0.8)
+      width: 2
+    fill: tozeroy
+    fillcolor: rgba(255, 255, 0, 0.1)
+    statistic: mean
+    period: auto
+    show_value: true
+    texttemplate: " %{y:.0f} W"
+  - entity: sensor.ezhi_on_grid_power
+    name: On-Grid Power (inverted)
+    yaxis: y1
+    line:
+      color: crimson
+      width: 2
+    statistic: mean
+    period: auto
+    filters:
+      - map_y_numbers: y * -1
+    show_value: true
+    texttemplate: " %{y:.0f} W"
+  - entity: sensor.ezhi_battery_state_of_charge
+    name: Battery SoC
+    yaxis: y3
+    line:
+      color: limegreen
+      width: 2
+    show_value: true
+    texttemplate: " %{y:.0f}%"
+  - entity: sensor.epex_spot_data_total_price
+    name: Electricity price (incl. fee)
+    yaxis: y2
+    line:
+      color: rgba(255, 165, 0, 1)
+      width: 2
+      shape: hv
+    filters:
+      - fn: |-
+          ({ meta }) => ({
+            xs: meta.data.map(({ start_time }) => new Date(start_time)),
+            ys: meta.data.map(({ price_per_kwh }) => price_per_kwh * 100 + 10.5),
+          })
+    show_value: true
+    texttemplate: " %{y:.2f} ct/kWh"
+  - entity: sensor.energy_optimizer_forecast
+    name: Consumption (planned)
+    yaxis: y1
+    line:
+      color: deepskyblue
+      width: 1
+      dash: dot
+      shape: hv
+    filters:
+      - fn: |-
+          ({ meta }) => {
+            const rows = (meta.data || []).filter((r) => r.forecast);
+            return {
+              xs: rows.map((r) => new Date(r.time)),
+              ys: rows.map((r) => r.cons_w),
+            };
+          }
+  - entity: sensor.energy_optimizer_forecast
+    name: PV (planned)
+    yaxis: y1
+    line:
+      color: rgba(255,255,0,0.9)
+      width: 1
+      dash: dot
+      shape: hv
+    filters:
+      - fn: |-
+          ({ meta }) => {
+            const rows = (meta.data || []).filter((r) => r.forecast);
+            return {
+              xs: rows.map((r) => new Date(r.time)),
+              ys: rows.map((r) => r.pv_w),
+            };
+          }
+  - entity: sensor.energy_optimizer_forecast
+    name: SoC (planned)
+    yaxis: y3
+    line:
+      color: limegreen
+      width: 1
+      dash: dot
+    filters:
+      - fn: |-
+          ({ meta }) => {
+            const rows = (meta.data || []).filter((r) => r.forecast);
+            return {
+              xs: rows.map((r) => new Date(r.time)),
+              ys: rows.map((r) => r.soc_pct),
+            };
+          }
+  - entity: ""
+    name: Now
+    yaxis: y3
+    showlegend: false
+    hoverinfo: skip
+    line:
+      width: 1
+      dash: dash
+      color: gray
+    x: $fn () => [Date.now(), Date.now()]
+    "y": $fn () => [-20, 100]
