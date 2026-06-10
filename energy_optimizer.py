@@ -3,11 +3,11 @@
 Energy Optimizer — pyscript (HACS) — Strategic planning layer only.
 
 ╔══════════════════════════════════════════════════════════════════════════╗
-║  VERSION: 2026.06.10c (strategy layer)                                     ║
+║  VERSION: 2026.06.10d (strategy layer)                                     ║
 ║  Must be paired with tactical YAML of the SAME version. The two files form ║
 ║  one system: the strategy writes mode_id 0/1/2, the tactical YAML reads it.║
 ║  If the versions differ, redeploy BOTH and reload.                         ║
-║  (2026.06.10a–c change nothing in the tactical contract — mode IDs and     ║
+║  (2026.06.10a–d change nothing in the tactical contract — mode IDs and     ║
 ║  helper entities are unchanged — so the tactical YAML only needs its       ║
 ║  version string bumped to match.)                                          ║
 ║                                                                            ║
@@ -61,6 +61,19 @@ Energy Optimizer — pyscript (HACS) — Strategic planning layer only.
 ║               record of the full day; the live outlook restarts            ║
 ║               fresh at the 00:00 cycle. Optional pruning via               ║
 ║               HISTORY_RETENTION_DAYS. No tactical/contract changes.        ║
+║   2026.06.10d Truly quiet logging, independent of HA logger config:        ║
+║               v-c only demoted messages to DEBUG, which still floods       ║
+║               installs where `logger:` raises pyscript (or default)        ║
+║               verbosity. All diagnostics now pass through _dbg() and       ║
+║               are not emitted at all unless VERBOSE=True. The cycle        ║
+║               summary logs at INFO only when the STRATEGY CHANGES.         ║
+║               Warnings are rate-limited per source (_warn, one per         ║
+║               WARN_COOLDOWN_MIN per key) so a persistent failure           ║
+║               (e.g. InfluxDB down: 12+ warnings PER CYCLE before)          ║
+║               warns once per window; errors stay unlimited. The EPEX       ║
+║               state-trigger is debounced 3 min — the sensor STATE          ║
+║               rolls every price slot and fired a full extra cycle          ║
+║               right next to each cron one. No tactical changes.            ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 
 Runs every 15 minutes (and on EPEX price update events).
@@ -193,7 +206,7 @@ from scipy.optimize import linprog
 
 # Version of this strategy layer. Must match the tactical YAML's version.
 # Logged on every strategic run so the running version is visible in the log.
-VERSION = "2026.06.10c"
+VERSION = "2026.06.10d"
 
 USE_LP_OPTIMIZER = True
 
@@ -371,18 +384,27 @@ def _history_md(day) -> str:
     # midnight_finalize() the night after with the executed-only record.
     return f"{HISTORY_DIR}/energy-optimizer-{day.strftime('%Y-%m-%d')}.md"
 
-# Logging (2026.06.10c): routine per-cycle messages are at DEBUG level and
-# hidden at HA's default log level. Only ONE info line per strategic cycle
-# (the decision summary "Mode=… | SOC=… | Price=… | LP=…"), rare events
-# (SOC emergency + recovery, manual run, daily finalize) and all warnings/
-# errors reach the HA log. To see everything again, add to configuration.yaml:
-#   logger:
-#     logs:
-#       custom_components.pyscript.file.energy_optimizer: debug
-# LOG_DEBUG additionally gates the VERY verbose data dumps (per-slot prices,
-# per-hour PV). Those are also at DEBUG level, so seeing them needs BOTH this
-# flag and the logger entry above.
+# ── Logging policy (2026.06.10d) ──────────────────────────────────────────
+# The script SELF-GATES its diagnostics: every routine message goes through
+# _dbg() and is NOT EMITTED AT ALL unless VERBOSE is True. This is deliberate:
+# v2026.06.10c only demoted messages to DEBUG level, which still floods the
+# main log on installs where `logger:` raises custom_components.pyscript (or
+# the default) to debug/info — a common leftover from developing pyscript
+# apps. Gating inside the script makes quietness independent of HA's logger
+# configuration. What still reaches the HA log, at ANY logger setting:
+#   * one INFO line when the STRATEGY CHANGES (not every cycle),
+#   * rare events: SOC emergency + recovery, manual run, daily finalize,
+#   * warnings — rate-limited via _warn() to one per source per
+#     WARN_COOLDOWN_MIN, so a persistent failure (e.g. InfluxDB unreachable,
+#     which previously produced 12+ warnings PER CYCLE) warns once per
+#     window instead of storming — and all errors (never limited).
+# Set VERBOSE = True to restore full diagnostics; they are emitted at INFO
+# level, so they are visible WITHOUT touching configuration.yaml. LOG_DEBUG
+# additionally gates the very large data dumps (per-slot prices, per-hour
+# PV) and requires VERBOSE as well.
+VERBOSE   = False
 LOG_DEBUG = False
+WARN_COOLDOWN_MIN = 30   # minutes between repeated warnings of the same kind
 
 # Timezone. Constructed LAZILY (not at module load) to avoid a blocking
 # zoneinfo file read inside the event loop during script load — Home Assistant
@@ -406,6 +428,28 @@ _ctx: dict = {
     "cons_cache": None,      # {"day": date, "profile": {(wd,h,q): W}}
     "soc_emergency": False,  # set by on_soc_critical, cleared on recovery
 }
+
+
+def _dbg(msg: str):
+    """Diagnostic message. Emitted only when VERBOSE is True (then at INFO
+    level, so no `logger:` configuration is needed to see it). With VERBOSE
+    False nothing is emitted, regardless of HA's logger settings."""
+    if VERBOSE:
+        log.info(msg)
+
+
+def _warn(key: str, msg: str):
+    """Rate-limited warning: at most one per WARN_COOLDOWN_MIN per key, so a
+    persistent failure condition warns once per window instead of storming the
+    log every cycle. Suppressed repeats are still visible under VERBOSE.
+    log.error sites are intentionally NOT limited."""
+    now_ts = datetime.now(timezone.utc).timestamp()
+    stamps = _ctx.setdefault("warn_ts", {})
+    if now_ts - stamps.get(key, 0.0) >= WARN_COOLDOWN_MIN * 60:
+        stamps[key] = now_ts
+        log.warning(msg)
+    else:
+        _dbg(f"(warning suppressed [{key}]) {msg}")
 
 # ════════════════════════════════════════════════════════════════════════════
 # BLOCKING FILE I/O PRIMITIVES — compiled, run via task.executor
@@ -456,7 +500,7 @@ async def _write_text_file(path: str, content: str) -> bool:
         await task.executor(_write_text_file_blocking, path, content)
         return True
     except Exception as exc:
-        log.warning(f"Could not write {path}: {exc}")
+        _warn(f"write:{path}", f"Could not write {path}: {exc}")
         return False
 
 
@@ -534,10 +578,10 @@ async def _fetch_historical_consumption(session: aiohttp.ClientSession) -> dict:
                     key = (wd, t_local.hour, t_local.minute // 15)
                     accum.setdefault(key, []).append(row[mean_idx])
             except Exception as exc:
-                log.warning(f"InfluxDB query error (wd {wd}, week -{week_back}): {exc}")
+                _warn("influx_consumption", f"InfluxDB query error (wd {wd}, week -{week_back}): {exc}")
 
     if not accum:
-        log.warning("No InfluxDB data — using fallback consumption profile")
+        _warn("influx_consumption", "No InfluxDB data — using fallback consumption profile")
         return _fallback_consumption()
 
     result: dict = {}
@@ -550,7 +594,7 @@ async def _fetch_historical_consumption(session: aiohttp.ClientSession) -> dict:
         result[k] = sorted_vals[idx]
 
     _ctx["cons_cache"] = {"day": today, "profile": result}
-    log.debug(
+    _dbg(
         f"Consumption profile rebuilt: weekdays {weekdays_done}, "
         f"{len(result)} slots, q{int(CONSUMPTION_QUANTILE * 100)} (cached for today)"
     )
@@ -595,7 +639,7 @@ async def _get_solar_actuals(session: aiohttp.ClientSession) -> dict:
         data   = await _influx_query(q, session)
         series = data.get("results", [{}])[0].get("series", [])
         if not series:
-            log.warning("No actual PV data from InfluxDB")
+            _warn("pv_actuals", "No actual PV data from InfluxDB")
             return actuals
         cols     = series[0]["columns"]
         t_idx    = cols.index("time")
@@ -607,12 +651,12 @@ async def _get_solar_actuals(session: aiohttp.ClientSession) -> dict:
                 row[t_idx].replace("Z", "+00:00")
             ).astimezone(TZ)
             actuals[t_local.hour] = float(row[mean_idx])
-        log.debug(f"PV actuals loaded: {len(actuals)} hours")
+        _dbg(f"PV actuals loaded: {len(actuals)} hours")
         if LOG_DEBUG:
             for h in sorted(actuals):
-                log.debug(f"  pv actual {h:02d}:00 = {actuals[h]:.0f}W")
+                _dbg(f"  pv actual {h:02d}:00 = {actuals[h]:.0f}W")
     except Exception as exc:
-        log.warning(f"PV actuals fetch error: {exc}")
+        _warn("pv_actuals", f"PV actuals fetch error: {exc}")
     return actuals
 
 
@@ -676,9 +720,9 @@ def _get_solar_forecast(actuals: dict) -> dict:
             forecast[(today, h)] = w
         # NB: pyscript's interpreter has no generator expressions — use a list comp.
         n_today = len([k for k in forecast if k[0] == today])
-        log.debug(f"Solcast today: {n_today} hours loaded")
+        _dbg(f"Solcast today: {n_today} hours loaded")
     except Exception as exc:
-        log.warning(f"Solar today error: {exc}")
+        _warn("solcast", f"Solar today error: {exc}")
 
     try:
         attrs  = state.getattr(E_SOLAR_TOMORROW) or {}
@@ -686,9 +730,9 @@ def _get_solar_forecast(actuals: dict) -> dict:
         parsed = _parse_hourly(fl, tomorrow)
         for h, w in parsed.items():
             forecast[(tomorrow, h)] = w
-        log.debug(f"Solcast tomorrow: {len(parsed)} hours added")
+        _dbg(f"Solcast tomorrow: {len(parsed)} hours added")
     except Exception as exc:
-        log.warning(f"Solar tomorrow error: {exc}")
+        _warn("solcast", f"Solar tomorrow error: {exc}")
 
     # Derive a scale factor from the last 2 completed hours of TODAY where
     # Solcast predicted meaningfully (>50 W) so we can correct systematic bias.
@@ -701,9 +745,9 @@ def _get_solar_forecast(actuals: dict) -> dict:
     if comparison_hours:
         raw_scale = sum(comparison_hours) / len(comparison_hours)
         scale     = max(0.3, min(2.0, raw_scale))
-        log.debug(f"PV scale factor: {scale:.2f} (raw {raw_scale:.2f}, {len(comparison_hours)} hours)")
+        _dbg(f"PV scale factor: {scale:.2f} (raw {raw_scale:.2f}, {len(comparison_hours)} hours)")
     else:
-        log.debug("PV scale factor: no comparison hours, using 1.0")
+        _dbg("PV scale factor: no comparison hours, using 1.0")
 
     # Build solar keyed by absolute hour-truncated datetime across the horizon
     solar: dict = {}
@@ -727,22 +771,22 @@ def _get_solar_forecast(actuals: dict) -> dict:
 
         if solar:
             peak = max(solar, key=solar.get)
-            log.debug(f"Solar blended: {len(solar)} hours, peak {solar[peak]:.0f}W at {peak:%H:%M}")
+            _dbg(f"Solar blended: {len(solar)} hours, peak {solar[peak]:.0f}W at {peak:%H:%M}")
             if LOG_DEBUG:
                 for k in sorted(solar):
                     if solar[k] > 0:
                         a_str = f" actual={actuals[k.hour]:.0f}W" if (k.date() == today and k.hour in actuals) else ""
                         f_str = f" fc={forecast.get((k.date(), k.hour), 0):.0f}W"
-                        log.debug(f"  solar {k:%Y-%m-%d %H:%M} = {solar[k]:.0f}W{a_str}{f_str}")
+                        _dbg(f"  solar {k:%Y-%m-%d %H:%M} = {solar[k]:.0f}W{a_str}{f_str}")
         return solar
 
     # Scalar last-resort fallback
     try:
         val = float(state.get(E_SOLAR_HOUR) or 0)
         solar[now.replace(minute=0, second=0, microsecond=0)] = val
-        log.warning(f"Solcast fallback scalar: {val}W for current hour only")
+        _warn("solcast_fallback", f"Solcast fallback scalar: {val}W for current hour only")
     except Exception as exc:
-        log.warning(f"Solar scalar fallback error: {exc}")
+        _warn("solcast_fallback", f"Solar scalar fallback error: {exc}")
     return solar
 
 
@@ -779,9 +823,9 @@ def _get_spot_prices() -> dict:
     try:
         raw_attrs = state.getattr(E_PRICE_DATA) or {}
         data      = raw_attrs.get("data", [])
-        log.debug(f"EPEX data slots found: {len(data)}")
+        _dbg(f"EPEX data slots found: {len(data)}")
         if data:
-            log.debug(f"EPEX first entry: {data[0]}")
+            _dbg(f"EPEX first entry: {data[0]}")
         for entry in data:
             t    = datetime.fromisoformat(entry["start_time"]).astimezone(TZ)
             epex = float(entry["price_per_kwh"])
@@ -795,7 +839,7 @@ def _get_spot_prices() -> dict:
         log.error(f"Spot price parse error: {exc}")
 
     if not prices:
-        log.warning("EPEX data unavailable — using fallback price curve")
+        _warn("epex_fallback", "EPEX data unavailable — using fallback price curve")
         return _fallback_prices()
     return prices
 
@@ -831,7 +875,7 @@ def _build_schedule(consumption: dict, solar: dict, prices: dict) -> list:
     now    = now.replace(minute=minute, second=0, microsecond=0)
 
     horizon = _compute_horizon(now, solar, prices)
-    log.debug(
+    _dbg(
         f"Planning horizon: {horizon} slots ({horizon*15/60:.1f}h) — "
         f"limited by the shortest of price/PV-forecast coverage."
     )
@@ -991,7 +1035,7 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         tv_price = pv_floor
     tv_price = max(tv_price, pv_floor)
 
-    log.debug(
+    _dbg(
         f"LP cost-optimizer: N={N} slots ({N*15/60:.1f}h)  "
         f"terminal={tv_price*100:.2f} ct/kWh (≥PV {PV_COST_CT:.1f}ct)  "
         f"prices p25={pq['p25']*100:.1f} p75={pq['p75']*100:.1f} ct  "
@@ -1116,7 +1160,7 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         return _heuristic_schedule(soc, schedule)
 
     if result.status != 0:
-        log.warning(f"LP status {result.status}: {result.message} — heuristic fallback")
+        _warn("lp_fallback", f"LP status {result.status}: {result.message} — heuristic fallback")
         return _heuristic_schedule(soc, schedule)
 
     # ── Extract setpoints + simulate SOC ──────────────────────────────────
@@ -1141,7 +1185,7 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         e  = max(E_min_eff, min(E_max, e))
 
     soc_end = e / BATTERY_SIZE_WH * 100.0
-    log.debug(
+    _dbg(
         f"LP solved ✓  slot-0={optimal[0]:+d}W  horizon_cost={total_cost:.4f}€  "
         f"SOC_end={soc_end:.0f}%"
     )
@@ -1190,7 +1234,7 @@ def _heuristic_schedule(soc: float, schedule: list) -> list:
     future_value   = _assess_future_value(schedule, p75)
     pv_recharge_wh = _estimate_pv_recharge(schedule, p75)
 
-    log.debug(
+    _dbg(
         f"Heuristic: P25={p25 * 100:.1f} P75={p75 * 100:.1f} ct/kWh | "
         f"Future demand={future_value['high_demand_wh']:.0f}Wh | "
         f"PV recharge={pv_recharge_wh:.0f}Wh | "
@@ -1236,9 +1280,9 @@ def _heuristic_schedule(soc: float, schedule: list) -> list:
 
 def _get_schedule(soc: float, schedule: list) -> list:
     if USE_LP_OPTIMIZER:
-        log.debug("Using LP optimizer")
+        _dbg("Using LP optimizer")
         return _solve_optimal_schedule(soc, schedule)
-    log.debug("Using heuristic optimizer")
+    _dbg("Using heuristic optimizer")
     return _heuristic_schedule(soc, schedule)
 
 
@@ -1346,7 +1390,7 @@ def _write_outputs(mode: str, sp: int):
     mode_id = MODE_IDS.get(mode, 0)
     input_number.set_value(entity_id=E_MODE_ID,  value=mode_id)
     input_number.set_value(entity_id=E_SETPOINT, value=sp)
-    log.debug(f"Output → mode_id={mode_id} ({mode}) setpoint={sp:+d}W")
+    _dbg(f"Output → mode_id={mode_id} ({mode}) setpoint={sp:+d}W")
 
 
 def _update_status(mode: str, reason: str):
@@ -1358,7 +1402,7 @@ def _update_status(mode: str, reason: str):
     label = mode_icons.get(mode, mode)
     input_text.set_value(entity_id=E_STATUS_MODE,   value=label)
     input_text.set_value(entity_id=E_STATUS_REASON, value=reason)
-    log.debug(f"Status: {label} | {reason}")
+    _dbg(f"Status: {label} | {reason}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1433,7 +1477,7 @@ async def _record_executed_slot(now, mode: str, reason: str, price: float,
         }
         await _write_text_file(_history_json(day), json.dumps(hist))
     except Exception as exc:
-        log.warning(f"Could not record executed slot: {exc}")
+        _warn("history_record", f"Could not record executed slot: {exc}")
 
 
 async def _mark_outlook_stale(msg: str):
@@ -1477,7 +1521,7 @@ async def _mark_outlook_stale(msg: str):
             f"> {msg}\n"
         )
     if await _write_text_file(OUTLOOK_FILE, content):
-        log.debug(f"Outlook marked stale: {msg}")
+        _dbg(f"Outlook marked stale: {msg}")
 
 
 def _slots_from_history(hist: dict, day_dt, qod_from: int, qod_to: int) -> list:
@@ -1600,7 +1644,7 @@ def _render_md_table(slots: list, header: str, now_hhmm) -> str:
 
 async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float, session: aiohttp.ClientSession):
     if not schedule or not optimal_schedule:
-        log.debug("Outlook: no schedule available")
+        _dbg("Outlook: no schedule available")
         await _mark_outlook_stale("No schedule available (missing price or PV data).")
         return
 
@@ -1707,9 +1751,9 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float, s
                 "data": attr_rows,
             },
         )
-        log.debug(f"Forecast sensor published ({len(attr_rows)} rows)")
+        _dbg(f"Forecast sensor published ({len(attr_rows)} rows)")
     except Exception as exc:
-        log.warning(f"Could not publish forecast sensor: {exc}")
+        _warn("forecast_sensor", f"Could not publish forecast sensor: {exc}")
 
     # ── Render + write the live outlook ───────────────────────────────────
     # Same now_dt as the history/forecast split above, so the header timestamp
@@ -1724,7 +1768,7 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float, s
     )
     content = _render_md_table(slots, header, now_dt.strftime("%H:%M"))
     if await _write_text_file(OUTLOOK_FILE, content):
-        log.debug(f"Outlook written to {OUTLOOK_FILE}")
+        _dbg(f"Outlook written to {OUTLOOK_FILE}")
 
     # ── Refresh today's rotated daily markdown (intraday view) ─────────────
     # energy-optimizer-YYYY-MM-DD.md mirrors the live outlook during its day
@@ -1734,9 +1778,9 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float, s
     # executed-only record of the complete day, freezing it as the archive.
     try:
         if await _write_text_file(_history_md(now_dt), content):
-            log.debug(f"Daily markdown refreshed: {_history_md(now_dt)}")
+            _dbg(f"Daily markdown refreshed: {_history_md(now_dt)}")
     except Exception as exc:
-        log.warning(f"Could not write daily markdown: {exc}")
+        _warn("daily_md", f"Could not write daily markdown: {exc}")
 
     # ── Write CSV forecast file ────────────────────────────────────────────
     try:
@@ -1762,9 +1806,9 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float, s
                 "soc_end_pct":   round(slot["soc_pct"], 1),
             })
         if await _write_text_file(FORECAST_CSV_FILE, buf.getvalue()):
-            log.debug(f"Forecast CSV written to {FORECAST_CSV_FILE}")
+            _dbg(f"Forecast CSV written to {FORECAST_CSV_FILE}")
     except Exception as exc:
-        log.warning(f"Could not write forecast CSV: {exc}")
+        _warn("forecast_csv", f"Could not write forecast CSV: {exc}")
 
     # ── Write forecast to InfluxDB ─────────────────────────────────────────
     # SCHEMA CHANGE 2026.06.10: `strategy` and `minutes_ahead` are now FIELDS,
@@ -1806,12 +1850,12 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float, s
             timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:
             if resp.status in (200, 204):
-                log.debug(f"Forecast written to InfluxDB ({len(lines)} points)")
+                _dbg(f"Forecast written to InfluxDB ({len(lines)} points)")
             else:
                 text = await resp.text()
-                log.warning(f"InfluxDB write failed: {resp.status} {text}")
+                _warn("influx_forecast", f"InfluxDB write failed: {resp.status} {text}")
     except Exception as exc:
-        log.warning(f"Could not write forecast to InfluxDB: {exc}")
+        _warn("influx_forecast", f"Could not write forecast to InfluxDB: {exc}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1827,8 +1871,9 @@ async def strategic_optimize():
     # (A cancelled instance aborts its pending outlook write — the surviving
     # newer run produces the fresh one, which is exactly what we want.)
     task.unique("energy_optimizer_strategic")
+    _ctx["last_cycle_ts"] = datetime.now(timezone.utc).timestamp()
 
-    log.debug(f"── Strategic cycle v{VERSION} ({'LP' if USE_LP_OPTIMIZER else 'Heuristic'}) ──")
+    _dbg(f"── Strategic cycle v{VERSION} ({'LP' if USE_LP_OPTIMIZER else 'Heuristic'}) ──")
     session = aiohttp.ClientSession()
     # Defined up-front so the finally-block outlook write is always safe, even if
     # the cycle raises before they are assigned.
@@ -1840,7 +1885,7 @@ async def strategic_optimize():
         soc_raw = state.get(E_BATTERY_SOC)
         if soc_raw in (None, "unavailable", "unknown"):
             skip_reason = "Battery SOC unavailable — cycle skipped."
-            log.warning("Battery SOC unavailable — skipping cycle")
+            _warn("soc_unavailable", "Battery SOC unavailable — skipping cycle")
             return
         soc = float(soc_raw)
 
@@ -1861,17 +1906,17 @@ async def strategic_optimize():
         prices      = _get_spot_prices()
 
         if LOG_DEBUG and prices:
-            log.debug("── EPEX prices (incl. network fee) ──")
+            _dbg("── EPEX prices (incl. network fee) ──")
             # Keys are uniformly (date, hour, quarter) since 2026.06.10 — the
             # fallback curve is date-keyed too.
             for k, p in sorted(prices.items(), key=lambda kv: kv[0]):
                 d, h, q = k
-                log.debug(f"  {d} {h:02d}:{q * 15:02d}  {p * 100:.3f} ct/kWh")
-            log.debug("─────────────────────────────────────")
+                _dbg(f"  {d} {h:02d}:{q * 15:02d}  {p * 100:.3f} ct/kWh")
+            _dbg("─────────────────────────────────────")
 
         if not prices:
             skip_reason = "No price data available — cycle skipped."
-            log.warning("No EPEX price data — mode unchanged")
+            _warn("epex_missing", "No EPEX price data — mode unchanged")
             return
 
         schedule         = _build_schedule(consumption, solar, prices)
@@ -1937,11 +1982,18 @@ async def strategic_optimize():
         await _record_executed_slot(now_slot, mode, short_reason, price,
                                     load0, pv0, hist_grid, hist_batt, soc)
 
-        log.info(
+        # One INFO line per STRATEGY CHANGE (a handful per day); unchanged-
+        # strategy cycles log the same summary only as a diagnostic.
+        summary = (
             f"Mode={mode} | SOC={soc:.0f}% | "
             f"Price={price * 100:.1f} ct | "
             f"LP={raw_sp:+d}W → Applied={sp:+d}W"
         )
+        if mode != _ctx.get("last_logged_mode"):
+            _ctx["last_logged_mode"] = mode
+            log.info(summary)
+        else:
+            _dbg(summary)
 
     except Exception as exc:
         import traceback
@@ -1958,7 +2010,7 @@ async def strategic_optimize():
                 await _mark_outlook_stale(skip_reason or "No schedule produced this cycle.")
         except Exception as exc:
             import traceback
-            log.warning(f"Outlook write failed: {exc}\n{traceback.format_exc()}")
+            _warn("outlook_write", f"Outlook write failed: {exc}\n{traceback.format_exc()}")
             try:
                 await _mark_outlook_stale(f"Outlook generation failed: {exc}")
             except Exception:
@@ -2027,7 +2079,7 @@ async def midnight_finalize():
                 if await _write_text_file(_history_md(yday), content):
                     log.info(f"Daily markdown finalized: {_history_md(yday)}")
         else:
-            log.debug(f"No history for {yday} — nothing to finalize")
+            _dbg(f"No history for {yday} — nothing to finalize")
     except Exception as exc:
         log.warning(f"Midnight finalize failed: {exc}")
 
@@ -2038,14 +2090,24 @@ async def midnight_finalize():
                 HISTORY_RETENTION_DAYS, now.date().toordinal(),
             )
             if removed:
-                log.debug(f"History pruned: {len(removed)} files removed")
+                _dbg(f"History pruned: {len(removed)} files removed")
         except Exception as exc:
             log.warning(f"History pruning failed: {exc}")
 
 
 @state_trigger(E_PRICE_DATA)
 async def on_price_update(**kwargs):
-    log.debug("EPEX price data updated — triggering strategic cycle")
+    """Replan when EPEX data changes — DEBOUNCED (2026.06.10d). The sensor's
+    STATE is the *current* price and rolls on every price slot, so this
+    trigger used to fire a full extra strategic cycle (with all its logging
+    and I/O) seconds next to each cron cycle. Skipping when a cycle started
+    within the last 3 minutes removes the duplicates while genuinely new
+    day-ahead data (published mid-hour) still accelerates replanning."""
+    now_ts = datetime.now(timezone.utc).timestamp()
+    if now_ts - _ctx.get("last_cycle_ts", 0.0) < 180:
+        _dbg("EPEX state change debounced (recent strategic cycle)")
+        return
+    _dbg("EPEX price data updated — triggering strategic cycle")
     await strategic_optimize()
 
 
