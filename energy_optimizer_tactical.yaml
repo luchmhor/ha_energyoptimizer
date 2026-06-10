@@ -1,0 +1,199 @@
+alias: Energy Optimizer — Tactical Control (v2026.06.10b)
+description: >
+  v2026.06.10b — must match energy_optimizer.py (strategy layer) version.
+  Runs every 5 seconds. Reads ONLY the strategy (mode_id 0–2: 0=FOLLOW_GRID,
+  1=HOLD, 2=GRID_CHARGE) from the optimizer and runs a proportional grid-
+  following controller to the hardware limits. The numeric strategic setpoint
+  is deliberately NOT consumed here — the strategic layer expresses its intent
+  purely through the mode, and the tactical layer decides the wattage in real
+  time from measured grid flow.
+
+  Why: the per-slot setpoint is sized to *forecast* load. Using it as a cap
+  meant any real load above forecast leaked to the grid (e.g. importing 500 W
+  while the battery was full). Following the mode and tracking real grid flow to
+  the hardware limits removes that failure mode entirely. Rationing now lives in
+  which mode the LP assigns to each slot, not in a wattage.
+
+  Sign convention (matches pyscript and inverter):
+    positive setpoint → discharge (battery → home bus)
+    negative setpoint → charge   (grid/PV → battery)
+    grid_w positive   → importing from grid
+    grid_w negative   → exporting to grid
+
+  Mode behaviour (bounds are hardware limits, not strategic values).
+  FIX 2026.06.10: this table previously documented the pre-2026.06.08 5-mode
+  scheme (0=BALANCE 1=GRID_CHARGE 2=DISCHARGE 3=TRICKLE 4=HOLD), contradicting
+  both the header above and the template code. The CODE was correct; the table
+  below now matches it and MODE_IDS in energy_optimizer.py:
+    0 FOLLOW_GRID: cover real load from the battery — track measured grid flow
+                   toward zero, floor 0 (never grid-charge, never export). With
+                   PV surplus it settles at the load and the surplus charges
+                   the battery via DC.
+    1 HOLD:        ration — ramp the setpoint to 0 and keep the battery idle.
+                   On this hardware that means the FULL load is imported from
+                   the grid and ALL PV charges the battery passively (the
+                   strategy layer's outlook/history simulate exactly this
+                   since 2026.06.10).
+    2 GRID_CHARGE: charge toward abs_max_charge; ease off if exporting; STOP
+                   (ramp to idle) at soc_grid_ceiling — mirrors
+                   GRID_CHARGE_SOC_CEILING_PCT in the LP, which can otherwise
+                   only re-enforce its ceiling at the 15-min replan.
+    Anti-curtailment override (latched, enter 99 / release 96): battery full —
+                   cover load from the battery regardless of mode so PV stays
+                   alive; floor 0, no export.
+    Unknown mode → ramp to idle (safe default).
+
+  Safety:
+    * Below soc_empty: discharge is forbidden (forced to 0); charge still allowed.
+    * Grid-meter or SOC sensor unavailable → RAMP THE SETPOINT TO 0 instead of
+      freezing the last command. (Old behaviour: a dead grid meter zeroed the
+      tracking error and held the last setpoint — e.g. 1200 W discharge —
+      indefinitely; a dead SOC sensor skipped the cycle with the same effect.)
+    * Cycle skipped only if the inverter entity itself is unavailable (nothing
+      could be written anyway).
+    * Final setpoint hard-clamped to [abs_max_charge, abs_max_dis].
+
+  Changelog v2026.06.10b:
+    * Version bump only — the strategy layer now publishes
+      sensor.energy_optimizer_forecast for dashboard cards. No tactical
+      changes; the control contract (mode IDs, helpers) is identical.
+
+  Changelog v2026.06.10a:
+    * Fixed the stale "Mode behaviour" table (see FIX note above).
+    * Removed dead TRICKLE-era variables (pv_w, batt_w, soc_full,
+      soc_trickle_start, trickle_charge) and the obsolete batt_w sign note —
+      they were evaluated every 5 s and used nowhere.
+    * GRID_CHARGE now respects soc_grid_ceiling (95 %, 1 % hysteresis via
+      grid_charge_blocked) instead of charging at full rate until the next
+      strategic replan.
+    * Sensor failsafes as described under Safety; the availability gate is
+      reduced to the inverter entity.
+    * Shared idle_target ramp used by HOLD, the ceiling stop, the sensor
+      failsafe and the unknown-mode default.
+
+  Constants below marked "must match" mirror energy_optimizer.py — change them
+  in BOTH files or not at all.
+
+  Verify on your hardware:
+    * number.apsystems_ezhi_max_output_power must accept negative values for
+      charging; if its min is 0 the charge path silently clamps.
+    * sensor.shrdzm_485519e15aae_16_7_0 sign: positive must mean grid IMPORT.
+    * With output 0 (HOLD), PV must charge the battery via DC — the strategy
+      layer's HOLD cost/SoC model assumes exactly this.
+triggers:
+  - trigger: time_pattern
+    seconds: /5
+actions:
+  - condition: template
+    value_template: "{{ inverter_avail }}"
+  - if:
+      - condition: template
+        value_template: |-
+          {{ (new_sp - current_sp) | abs >= 10
+             or (soc <= soc_empty and current_sp > 0) }}
+    then:
+      - action: number.set_value
+        target:
+          entity_id: number.apsystems_ezhi_max_output_power
+        data:
+          value: "{{ new_sp }}"
+mode: single
+max_exceeded: silent
+variables:
+  mode_id: "{{ states('input_number.energy_optimizer_mode_id') | int(0) }}"
+  grid_w: >-
+    {{ states('sensor.shrdzm_485519e15aae_16_7_0') | float(0) | round(0) | int
+    }}
+  soc: "{{ states('sensor.ezhi_battery_state_of_charge') | float(50) }}"
+  current_sp: >-
+    {{ states('number.apsystems_ezhi_max_output_power') | float(0) | round(0) |
+    int }}
+  inverter_avail: "{{ has_value('number.apsystems_ezhi_max_output_power') }}"
+  soc_avail: "{{ has_value('sensor.ezhi_battery_state_of_charge') }}"
+  grid_avail: "{{ has_value('sensor.shrdzm_485519e15aae_16_7_0') }}"
+  deadband: 30
+  abs_max_charge: -1200 # must match OUTPUT_MIN_W
+  abs_max_dis: 1200 # must match OUTPUT_MAX_W
+  soc_empty: 15 # must match BATTERY_EMPTY_PCT
+  soc_grid_ceiling: 95 # must match GRID_CHARGE_SOC_CEILING_PCT
+  idle_ramp: 50
+  soc_curtail_enter: 99
+  soc_curtail_release: 96
+  step: |
+    {% set err = grid_w | abs %}
+    {% if   err > 300 %}100
+    {% elif err > 150 %}50
+    {% elif err > 75  %}30
+    {% elif err > 30  %}20
+    {% else %}0
+    {% endif %}
+  anti_curtail: |-
+    {{ soc >= soc_curtail_enter
+       or (soc >= soc_curtail_release and current_sp > deadband) }}
+  grid_charge_blocked: |-
+    {{ soc >= soc_grid_ceiling
+       or (soc >= (soc_grid_ceiling - 1) and current_sp >= 0) }}
+  idle_target: |
+    {% set t = current_sp %}
+    {% if t > idle_ramp %}{{ [0, t - idle_ramp] | max }}
+    {% elif t < (idle_ramp * -1) %}{{ [0, t + idle_ramp] | min }}
+    {% else %}0{% endif %}
+  target_sp: |
+    {% set s = step | int %}
+    {% set t = current_sp %}
+    {% if not soc_avail or not grid_avail %}
+      {# SENSOR FAILSAFE — a dead grid meter would zero the tracking error and  #}
+      {# FREEZE the last setpoint forever; a dead SOC sensor would let us       #}
+      {# discharge blind. Ramp to idle instead and let PV charge passively.     #}
+      {% set r = idle_target | int %}
+    {% elif anti_curtail %}
+      {# ANTI-CURTAILMENT (overrides strategy while latched). Battery is full: #}
+      {# keep PV alive by covering load from the battery (floor 0, no export). #}
+      {# This routes PV to the home bus and bleeds SoC, leaving headroom for   #}
+      {# PV to charge back in — a slow cycle bounded by the hysteresis band.   #}
+      {# With zero load and full battery, curtailment of surplus above load is #}
+      {# physically unavoidable without export; this maximises useful PV.      #}
+      {# (The LP grants the same re-route per slot via its passive-SOC         #}
+      {# envelope; this latch is the real-time realisation of it.)             #}
+      {% if s == 0 %}{% set r = t %}
+      {% elif grid_w > deadband %}{% set r = [abs_max_dis, t + s] | min %}
+      {% elif grid_w < (deadband * -1) %}{% set r = [0, t - s] | max %}
+      {% else %}{% set r = t %}{% endif %}
+    {% elif mode_id == 0 %}
+      {# FOLLOW_GRID — cover real load from the battery, track toward zero grid #}
+      {# flow, floor 0 (never charge from grid, never export). If PV already    #}
+      {# covers load there is no import and it naturally stays at 0.            #}
+      {% if s == 0 %}{% set r = t %}
+      {% elif grid_w > deadband %}{% set r = [abs_max_dis, t + s] | min %}
+      {% elif grid_w < (deadband * -1) %}{% set r = [0, t - s] | max %}
+      {% else %}{% set r = t %}{% endif %}
+    {% elif mode_id == 1 %}
+      {# HOLD — ration. Keep the battery fully idle and import load from grid,   #}
+      {# to preserve a limited battery for a pricier peak ahead (or because the  #}
+      {# battery is at its floor). Ramp the setpoint to 0 and never discharge.   #}
+      {# PV still charges passively through the inverter.                        #}
+      {% set r = idle_target | int %}
+    {% elif mode_id == 2 %}
+      {# GRID_CHARGE — charge the battery toward abs_max_charge; ease off when   #}
+      {# PV surplus is exporting. STOP at the SOC ceiling (grid_charge_blocked,  #}
+      {# 1% hysteresis): the LP plans within GRID_CHARGE_SOC_CEILING_PCT but can #}
+      {# only re-enforce it every 15 min — without this check a single slot at   #}
+      {# full rate could push SOC well past the ceiling between replans. PV may  #}
+      {# continue charging passively above the ceiling, as designed.             #}
+      {% if grid_charge_blocked %}
+        {% set r = idle_target | int %}
+      {% elif s == 0 %}{% set r = t %}
+      {% elif grid_w < (deadband * -1) %}{% set r = [0, t + s] | min %}
+      {% elif grid_w > deadband %}{% set r = [abs_max_charge, t - s] | max %}
+      {% else %}{% set r = t %}{% endif %}
+    {% else %}
+      {# Unknown mode → safe default: idle the battery. #}
+      {% set r = idle_target | int %}
+    {% endif %}
+    {{ r | int }}
+  new_sp: |
+    {% set r = target_sp | int %}
+    {% if soc <= soc_empty and r > 0 %}{% set r = 0 %}{% endif %}
+    {% set r = [r, abs_max_dis] | min %}
+    {% set r = [r, abs_max_charge] | max %}
+    {{ r | int }}
