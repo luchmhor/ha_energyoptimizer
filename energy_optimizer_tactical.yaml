@@ -1,6 +1,6 @@
-alias: Energy Optimizer — Tactical Control (v2026.06.10b)
+alias: Energy Optimizer — Tactical Control (v2026.06.10c)
 description: >
-  v2026.06.10b — must match energy_optimizer.py (strategy layer) version.
+  v2026.06.10c — must match energy_optimizer.py (strategy layer) version.
   Runs every 5 seconds. Reads ONLY the strategy (mode_id 0–2: 0=FOLLOW_GRID,
   1=HOLD, 2=GRID_CHARGE) from the optimizer and runs a proportional grid-
   following controller to the hardware limits. The numeric strategic setpoint
@@ -52,6 +52,11 @@ description: >
     * Cycle skipped only if the inverter entity itself is unavailable (nothing
       could be written anyway).
     * Final setpoint hard-clamped to [abs_max_charge, abs_max_dis].
+
+  Changelog v2026.06.10c:
+    * Version bump only — strategy layer quieted its logging and rotates the
+      daily markdown (energy-optimizer-YYYY-MM-DD.md, finalized nightly).
+      No tactical changes; the control contract is identical.
 
   Changelog v2026.06.10b:
     * Version bump only — the strategy layer now publishes
