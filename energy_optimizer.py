@@ -3,11 +3,11 @@
 Energy Optimizer — pyscript (HACS) — Strategic planning layer only.
 
 ╔══════════════════════════════════════════════════════════════════════════╗
-║  VERSION: 2026.06.10d (strategy layer)                                     ║
+║  VERSION: 2026.06.10f (strategy layer)                                     ║
 ║  Must be paired with tactical YAML of the SAME version. The two files form ║
 ║  one system: the strategy writes mode_id 0/1/2, the tactical YAML reads it.║
 ║  If the versions differ, redeploy BOTH and reload.                         ║
-║  (2026.06.10a–d change nothing in the tactical contract — mode IDs and     ║
+║  (2026.06.10a–f change nothing in the tactical contract — mode IDs and     ║
 ║  helper entities are unchanged — so the tactical YAML only needs its       ║
 ║  version string bumped to match.)                                          ║
 ║                                                                            ║
@@ -74,6 +74,27 @@ Energy Optimizer — pyscript (HACS) — Strategic planning layer only.
 ║               state-trigger is debounced 3 min — the sensor STATE          ║
 ║               rolls every price slot and fired a full extra cycle          ║
 ║               right next to each cron one. No tactical changes.            ║
+║   2026.06.10e Load banner: exactly ONE info line on (re)load with the      ║
+║               running version — the deployment beacon. Per-slot price      ║
+║               dumps and the in-log outlook table cannot be produced        ║
+║               by ≥10c at default flags (the table code was removed in      ║
+║               10c); if they appear, an OLD copy is running. Remember:      ║
+║               pyscript does NOT auto-reload on file changes (call the      ║
+║               pyscript.reload service), and it loads EVERY .py in          ║
+║               /config/pyscript — a stale backup copy runs IN PARALLEL      ║
+║               and fights this script for the helpers. No tactical or       ║
+║               contract changes.                                            ║
+║   2026.06.10f Self-test service pyscript.energy_optimizer_self_test:       ║
+║               probes every link of the chain (version/triggers/input       ║
+║               sensors/file writes/state.set/InfluxDB), runs one real       ║
+║               cycle and reports whether the forecast sensor exists         ║
+║               afterwards — as a persistent notification + one INFO         ║
+║               log block. If the service is not even listed under           ║
+║               Developer Tools → Actions, the file is NOT LOADED:           ║
+║               search the log for "Exception in </config/pyscript/          ║
+║               energy_optimizer" (a compile/load error, e.g. pyscript       ║
+║               older than 1.4 lacking @pyscript_compile/task.executor       ║
+║               → update pyscript via HACS). No tactical changes.            ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 
 Runs every 15 minutes (and on EPEX price update events).
@@ -206,7 +227,7 @@ from scipy.optimize import linprog
 
 # Version of this strategy layer. Must match the tactical YAML's version.
 # Logged on every strategic run so the running version is visible in the log.
-VERSION = "2026.06.10d"
+VERSION = "2026.06.10f"
 
 USE_LP_OPTIMIZER = True
 
@@ -2162,7 +2183,123 @@ async def on_soc_critical(value=None, old_value=None, **kwargs):
 # ════════════════════════════════════════════════════════════════════════════
 
 @service
+async def energy_optimizer_self_test():
+    """End-to-end diagnostic for 'the forecast sensor never appears' problems.
+    Call via Developer Tools → Actions → pyscript.energy_optimizer_self_test.
+    Results are posted as a persistent notification AND logged once at INFO.
+
+    If this service is NOT listed in Developer Tools at all, the file is not
+    loaded: search the HA log for "Exception in </config/pyscript/
+    energy_optimizer" (load/compile error — e.g. a pyscript version older
+    than 1.4, which lacks @pyscript_compile/task.executor; update pyscript
+    via HACS), verify the file is at /config/pyscript/energy_optimizer.py,
+    remove stale .py copies, and call the pyscript.reload service."""
+    _ensure_tz()
+    now = datetime.now(TZ)
+
+    def _safe_get(ent):
+        try:
+            return state.get(ent)
+        except Exception:
+            return None
+
+    lines = [f"version loaded: v{VERSION}"]
+
+    ts = _ctx.get("last_cycle_ts")
+    if ts:
+        age_min = (datetime.now(timezone.utc).timestamp() - ts) / 60.0
+        lines.append(f"last strategic cycle: ✓ {age_min:.1f} min ago")
+    else:
+        lines.append("last strategic cycle: ✗ NEVER since load — cron not firing?")
+
+    for label, ent in (
+        ("battery SOC",   E_BATTERY_SOC),
+        ("EPEX price",    E_PRICE_DATA),
+        ("Solcast today", E_SOLAR_TODAY),
+        ("mode helper",   E_MODE_ID),
+    ):
+        v = _safe_get(ent)
+        if v in (None, "unavailable", "unknown"):
+            lines.append(f"{label}: ✗ {v} ({ent})")
+        else:
+            lines.append(f"{label}: ✓ {str(v)[:40]}")
+
+    try:
+        epex_n = len((state.getattr(E_PRICE_DATA) or {}).get("data", []))
+        lines.append(f"EPEX attribute slots: {'✓' if epex_n else '✗'} {epex_n}")
+    except Exception as exc:
+        lines.append(f"EPEX attribute slots: ✗ ERROR {exc}")
+
+    ok = await _write_text_file(f"{HISTORY_DIR}/selftest.txt",
+                                f"self-test {now.isoformat()}\n")
+    lines.append(f"file write ({HISTORY_DIR}): {'✓' if ok else '✗ FAILED'}")
+
+    try:
+        state.set(
+            "sensor.energy_optimizer_selftest",
+            value=now.strftime("%H:%M:%S"),
+            new_attributes={"friendly_name": "Energy Optimizer Self-Test"},
+        )
+        chk = _safe_get("sensor.energy_optimizer_selftest")
+        lines.append(f"state.set → sensor: {'✓ readback ' + str(chk) if chk else '✗ readback empty'}")
+    except Exception as exc:
+        lines.append(f"state.set → sensor: ✗ ERROR {exc}")
+
+    session = aiohttp.ClientSession()
+    try:
+        await _influx_query("SHOW DATABASES", session)
+        lines.append("InfluxDB: ✓ reachable")
+    except Exception as exc:
+        lines.append(f"InfluxDB: ✗ {exc}")
+    finally:
+        await session.close()
+
+    pre = _safe_get(E_FORECAST_SENSOR)
+    pre_ok = pre not in (None, "unknown", "unavailable")
+    lines.append(f"forecast sensor before: {('✓ ' + str(pre) + ' rows') if pre_ok else '✗ missing'}")
+
+    lines.append("— running one strategic cycle —")
+    await strategic_optimize()
+
+    post = _safe_get(E_FORECAST_SENSOR)
+    if post not in (None, "unknown", "unavailable"):
+        lines.append(f"forecast sensor after: ✓ {post} rows — the card's dotted"
+                     f" lines should appear within one refresh")
+    else:
+        lines.append("forecast sensor after: ✗ STILL MISSING")
+        lines.append(f"last status reason: {_safe_get(E_STATUS_REASON)}")
+        lines.append("→ search the FULL log for 'Strategic error' and"
+                     " 'Could not publish forecast sensor'")
+
+    report = "\n".join(["• " + l for l in lines])
+    persistent_notification.create(
+        title=f"Energy Optimizer self-test (v{VERSION})",
+        message=report,
+        notification_id="energy_optimizer_selftest",
+    )
+    log.info(f"Self-test result:\n{report}")
+
+
+@service
 async def energy_optimizer_force_run():
     """Callable via Developer Tools → Actions → pyscript.energy_optimizer_force_run"""
     log.info("Manual trigger — running strategic cycle now")
     await strategic_optimize()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# LOAD BANNER — deployment beacon
+# ════════════════════════════════════════════════════════════════════════════
+# Exactly ONE info line at (re)load, deliberately kept visible even in quiet
+# mode. If the HA log shows old-style chatter (per-slot price dumps, the
+# outlook table mirrored to the log), the FIRST check is what version this
+# banner reports — and whether a new banner appeared at all after deploying
+# (pyscript does not auto-reload; call the pyscript.reload service). If TWO
+# banners with different versions appear at one reload, a stale backup copy
+# of this script is also loaded from /config/pyscript (pyscript loads every
+# .py file there) and must be renamed to .py.bak or removed — it would run
+# in parallel and fight this script for the mode helpers.
+log.info(
+    f"energy_optimizer v{VERSION} loaded "
+    f"(quiet logging: VERBOSE={VERBOSE}, LOG_DEBUG={LOG_DEBUG})"
+)
