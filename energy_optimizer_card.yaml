@@ -146,6 +146,7 @@ entities:
   - entity: sensor.epex_spot_data_total_price
     name: Electricity price (incl. fee)
     legendgroup: price
+    unit_of_measurement: ct/kWh   # filter converts €→ct; override hover unit
     yaxis: y2
     extend_to_present: true
     line:
@@ -163,6 +164,7 @@ entities:
     name: Electricity price (incl. fee)
     legendgroup: price
     showlegend: false
+    unit_of_measurement: ct/kWh   # filter converts €→ct; override hover unit
     yaxis: y2
     line:
       color: rgba(255, 165, 0, 1)
@@ -182,6 +184,7 @@ entities:
           }
   - entity: sensor.energy_optimizer_forecast
     name: Consumption (planned)
+    unit_of_measurement: W
     yaxis: y1
     line:
       color: deepskyblue
@@ -201,6 +204,7 @@ entities:
           }
   - entity: sensor.energy_optimizer_forecast
     name: PV (planned)
+    unit_of_measurement: W
     yaxis: y1
     line:
       color: rgba(255,255,0,0.9)
@@ -220,6 +224,7 @@ entities:
           }
   - entity: sensor.energy_optimizer_forecast
     name: SoC (planned)
+    unit_of_measurement: "%"
     yaxis: y3
     line:
       color: limegreen
