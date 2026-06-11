@@ -20,6 +20,17 @@
 #     fetch a month of 5-minute buckets.
 #   * NEW: dotted planned consumption, planned PV and planned SoC from
 #     sensor.energy_optimizer_forecast (stepped hv for the 15-min slot values).
+#   * PRICE HISTORY (rev 3): the price is now drawn as two joined traces —
+#     past from the recorder's state history, future from the attribute data
+#     sliced to "now onward" (one legend entry via legendgroup). Past days no
+#     longer vanish from the plot.
+#   * HARDENED (rev 2): the forecast filters read the sensor's LIVE attributes
+#     via hass.states[...] instead of `meta`, with full guards — if the sensor
+#     does not exist (yet) the traces render as empty instead of throwing and
+#     being dropped, and the read is independent of recorder exclusion. NOTE:
+#     the dotted lines can only appear once sensor.energy_optimizer_forecast
+#     exists (strategy layer ≥ v2026.06.10b deployed AND one strategic cycle
+#     completed since the last HA restart / pyscript reload).
 type: custom:plotly-graph
 time_offset: 1d
 refresh_interval: 15s
@@ -122,8 +133,36 @@ entities:
       width: 2
     show_value: true
     texttemplate: " %{y:.0f}%"
+  # ── Price, PAST — from the HA recorder's state history. The sensor's state
+  # is the current price (€/kWh) and changes once per slot, so its history IS
+  # the past price curve; the card fetches it natively. The EPEX attribute
+  # only carries today+tomorrow, which is why past days vanished before. No
+  # InfluxDB involved (filters run in the browser, which cannot reach it).
+  # Coverage = recorder retention (purge_keep_days, default 10 days); for the
+  # 2W/1M buttons beyond that, switch this trace to `statistic: mean` +
+  # `period: auto` (works only if the sensor records long-term statistics).
+  # The +10.5 ct fee is applied uniformly — adjust if your fee changed over
+  # the displayed period.
   - entity: sensor.epex_spot_data_total_price
     name: Electricity price (incl. fee)
+    legendgroup: price
+    yaxis: y2
+    extend_to_present: true
+    line:
+      color: rgba(255, 165, 0, 1)
+      width: 2
+      shape: hv
+    filters:
+      - map_y_numbers: y * 100 + 10.5
+    show_value: true
+    texttemplate: " %{y:.2f} ct/kWh"
+  # ── Price, FUTURE — from the live attribute data (today+tomorrow), sliced
+  # to the current slot onward so it doesn't double-draw over the history
+  # trace. Same legendgroup → one legend entry toggles past+future together.
+  - entity: sensor.epex_spot_data_total_price
+    name: Electricity price (incl. fee)
+    legendgroup: price
+    showlegend: false
     yaxis: y2
     line:
       color: rgba(255, 165, 0, 1)
@@ -131,12 +170,16 @@ entities:
       shape: hv
     filters:
       - fn: |-
-          ({ meta }) => ({
-            xs: meta.data.map(({ start_time }) => new Date(start_time)),
-            ys: meta.data.map(({ price_per_kwh }) => price_per_kwh * 100 + 10.5),
-          })
-    show_value: true
-    texttemplate: " %{y:.2f} ct/kWh"
+          ({ meta }) => {
+            const cutoff = Date.now() - 15 * 60 * 1000;
+            const rows = ((meta && meta.data) || []).filter(
+              (e) => new Date(e.start_time).getTime() >= cutoff
+            );
+            return {
+              xs: rows.map((e) => new Date(e.start_time)),
+              ys: rows.map((e) => Number(e.price_per_kwh) * 100 + 10.5),
+            };
+          }
   - entity: sensor.energy_optimizer_forecast
     name: Consumption (planned)
     yaxis: y1
@@ -147,11 +190,13 @@ entities:
       shape: hv
     filters:
       - fn: |-
-          ({ meta }) => {
-            const rows = (meta.data || []).filter((r) => r.forecast);
+          ({ hass }) => {
+            const st = hass.states['sensor.energy_optimizer_forecast'];
+            const rows = ((st && st.attributes && st.attributes.data) || [])
+              .filter((r) => r.forecast);
             return {
               xs: rows.map((r) => new Date(r.time)),
-              ys: rows.map((r) => r.cons_w),
+              ys: rows.map((r) => Number(r.cons_w)),
             };
           }
   - entity: sensor.energy_optimizer_forecast
@@ -164,11 +209,13 @@ entities:
       shape: hv
     filters:
       - fn: |-
-          ({ meta }) => {
-            const rows = (meta.data || []).filter((r) => r.forecast);
+          ({ hass }) => {
+            const st = hass.states['sensor.energy_optimizer_forecast'];
+            const rows = ((st && st.attributes && st.attributes.data) || [])
+              .filter((r) => r.forecast);
             return {
               xs: rows.map((r) => new Date(r.time)),
-              ys: rows.map((r) => r.pv_w),
+              ys: rows.map((r) => Number(r.pv_w)),
             };
           }
   - entity: sensor.energy_optimizer_forecast
@@ -180,11 +227,13 @@ entities:
       dash: dot
     filters:
       - fn: |-
-          ({ meta }) => {
-            const rows = (meta.data || []).filter((r) => r.forecast);
+          ({ hass }) => {
+            const st = hass.states['sensor.energy_optimizer_forecast'];
+            const rows = ((st && st.attributes && st.attributes.data) || [])
+              .filter((r) => r.forecast);
             return {
               xs: rows.map((r) => new Date(r.time)),
-              ys: rows.map((r) => r.soc_pct),
+              ys: rows.map((r) => Number(r.soc_pct)),
             };
           }
   - entity: ""
