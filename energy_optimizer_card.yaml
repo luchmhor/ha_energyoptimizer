@@ -20,6 +20,11 @@
 #     fetch a month of 5-minute buckets.
 #   * NEW: dotted planned consumption, planned PV and planned SoC from
 #     sensor.energy_optimizer_forecast (stepped hv for the 15-min slot values).
+#   * COMPACT SENSOR (rev 4): the forecast sensor now publishes FUTURE rows
+#     only, with compact keys (t,s,c,p,g,b,pr,so), to stay under the recorder's
+#     16 KB attribute cap. Filters read r.t / r.c / r.p / r.so and no longer
+#     filter on a per-row forecast flag (every row is a forecast). Requires
+#     energy_optimizer.py >= v2026.06.10g.
 #   * PRICE HISTORY (rev 3): the price is now drawn as two joined traces —
 #     past from the recorder's state history, future from the attribute data
 #     sliced to "now onward" (one legend entry via legendgroup). Past days no
@@ -195,11 +200,10 @@ entities:
       - fn: |-
           ({ hass }) => {
             const st = hass.states['sensor.energy_optimizer_forecast'];
-            const rows = ((st && st.attributes && st.attributes.data) || [])
-              .filter((r) => r.forecast);
+            const rows = (st && st.attributes && st.attributes.data) || [];
             return {
-              xs: rows.map((r) => new Date(r.time)),
-              ys: rows.map((r) => Number(r.cons_w)),
+              xs: rows.map((r) => new Date(r.t)),
+              ys: rows.map((r) => Number(r.c)),
             };
           }
   - entity: sensor.energy_optimizer_forecast
@@ -215,11 +219,10 @@ entities:
       - fn: |-
           ({ hass }) => {
             const st = hass.states['sensor.energy_optimizer_forecast'];
-            const rows = ((st && st.attributes && st.attributes.data) || [])
-              .filter((r) => r.forecast);
+            const rows = (st && st.attributes && st.attributes.data) || [];
             return {
-              xs: rows.map((r) => new Date(r.time)),
-              ys: rows.map((r) => Number(r.pv_w)),
+              xs: rows.map((r) => new Date(r.t)),
+              ys: rows.map((r) => Number(r.p)),
             };
           }
   - entity: sensor.energy_optimizer_forecast
@@ -234,11 +237,10 @@ entities:
       - fn: |-
           ({ hass }) => {
             const st = hass.states['sensor.energy_optimizer_forecast'];
-            const rows = ((st && st.attributes && st.attributes.data) || [])
-              .filter((r) => r.forecast);
+            const rows = (st && st.attributes && st.attributes.data) || [];
             return {
-              xs: rows.map((r) => new Date(r.time)),
-              ys: rows.map((r) => Number(r.soc_pct)),
+              xs: rows.map((r) => new Date(r.t)),
+              ys: rows.map((r) => Number(r.so)),
             };
           }
   - entity: ""
