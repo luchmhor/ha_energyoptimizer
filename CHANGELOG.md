@@ -1,10 +1,14 @@
 # Changelog — Energy Optimizer
 
-All notable changes to the strategy layer (`energy_optimizer.py`) and the
-tactical layer (`energy_optimizer_tactical.yaml`). The two are version-locked
-and must be deployed as a matched pair. Versions tagged *(tactical: bump only)*
-change nothing in the control contract (mode IDs / helper entities); the
-tactical file only needs its version string updated to match.
+All notable changes to the Energy Optimizer system:
+the strategy layer (`energy_optimizer.py`), the tactical layer
+(`energy_optimizer_tactical.yaml`) and the dashboard card
+(`energy_overview_card.yaml`). Strategy and tactical are version-locked and
+must be deployed as a matched pair; versions tagged *(tactical: bump only)*
+change nothing in the control contract (mode IDs / helper entities). The
+dashboard card has its own revision track (it reads the strategy layer's
+output but has no control role); the **Dashboard card** section at the end
+records its changes.
 
 ## 2026.06.10j
 
@@ -67,3 +71,39 @@ LP rebuilt on 4 variable groups: PV-surplus charging is now an LP DECISION (y_pv
 ## 2026.06.08
 
 3-strategy model (FOLLOW_GRID/HOLD/GRID_CHARGE); data-driven horizon; pure cost LP; PV cost 4.5ct; terminal value = PV floor (fixes peak-charging); battery throughput cost; PV-surplus → FOLLOW_GRID (fixes high-price morning import); executed-history outlook + Why column + per-day archive.
+
+---
+
+## Dashboard card — `energy_overview_card.yaml`
+
+The Plotly overview card. Its revisions are independent of the strategy/tactical
+versions; each notes the minimum strategy version it requires.
+
+### rev 4 — compact sensor (requires strategy ≥ v2026.06.10g)
+Forecast traces updated for the slimmed `sensor.energy_optimizer_forecast`
+payload: read compact keys (`r.t`, `r.c`, `r.p`, `r.so`) and no longer filter on
+a per-row `forecast` flag (the sensor now publishes future-only rows, so every
+row is a forecast). Without this change the dotted planned-consumption/PV/SoC
+lines silently render nothing against a g+ sensor.
+
+### rev 3 — price history
+Price drawn as two joined traces sharing one legend entry (`legendgroup`): the
+past from the recorder's state history (`extend_to_present`), the future from the
+EPEX attribute data sliced to "now onward" so the two don't double-draw. Past
+days no longer vanish from the plot. Hover unit overridden to `ct/kWh` (the
+filter converts €→ct); planned traces given `W` / `%` hover units.
+
+### rev 2 — hardened forecast filters
+Forecast filters read the sensor's live attributes via `hass.states[...]` instead
+of `meta`, with full guards, so a missing sensor renders empty instead of throwing
+(and the read is independent of recorder exclusion).
+
+### rev 1 — initial overview + planned traces
+First version with dotted planned consumption, PV and SoC from
+`sensor.energy_optimizer_forecast`. Fixes over the original card: 6h range button
+(was 12 h), the now-line moved to the fixed invisible y3 axis (full height, dark-
+theme visible, hover disabled), removed the non-option `default: null`, EPEX price
+drawn stepped (`shape: hv`) with the +10.5 ct network fee, removed no-op identity
+filters, `show_value` added so the power-trace labels render, and `period: auto`
+on the statistics traces so the wide range buttons don't fetch a month of
+5-minute buckets.
