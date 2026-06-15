@@ -1,41 +1,10 @@
-# Energy Overview — plotly-graph card, paired with energy_optimizer.py ≥ v2026.06.10b
-# (the dotted "planned" traces read sensor.energy_optimizer_forecast, which the
-#  strategy layer publishes every cycle; rows with forecast=true start at "now").
+# Energy Overview — plotly-graph card for the Energy Optimizer.
+# Reads sensor.energy_optimizer_forecast (strategy layer ≥ v2026.06.10g, compact
+# keys) for the dotted planned traces, plus EPEX/recorder history for prices.
+# The dotted lines appear once that sensor exists (one strategic cycle after an
+# HA restart / pyscript reload; ≥ v2026.06.10j republishes it automatically).
 #
-# Changes vs previous version:
-#   * FIX: "6h" range button actually selected 12 h (count 0.5 day) → 0.25.
-#   * FIX: "Now" line moved to the invisible, fixed y3 axis spanning −20…100,
-#     so it always covers the full plot height — it previously drew −1000…2500
-#     on y1, mismatching the −500…2500 axis and breaking if you rescale y1.
-#     Also gray instead of black (visible in dark themes), hover disabled.
-#   * FIX: removed `default: null` (not a card option — silently ignored).
-#   * EPEX price now drawn stepped (line.shape: hv — spot prices are piecewise
-#     constant; linear interpolation drew prices that never existed) and with
-#     the +10.5 ct network fee added so the curve is the price the optimizer
-#     actually optimises (matches NETWORK_FEE_CT_PER_KWH and the ct values in
-#     the optimizer's reason texts). Remove "+ 10.5" if you want raw EPEX.
-#   * Removed no-op identity filters (map_y_numbers: "y").
-#   * show_value on the power traces (texttemplates were dead without it).
-#   * period: auto on statistics traces, so the 1W/2W/1M range buttons don't
-#     fetch a month of 5-minute buckets.
-#   * NEW: dotted planned consumption, planned PV and planned SoC from
-#     sensor.energy_optimizer_forecast (stepped hv for the 15-min slot values).
-#   * COMPACT SENSOR (rev 4): the forecast sensor now publishes FUTURE rows
-#     only, with compact keys (t,s,c,p,g,b,pr,so), to stay under the recorder's
-#     16 KB attribute cap. Filters read r.t / r.c / r.p / r.so and no longer
-#     filter on a per-row forecast flag (every row is a forecast). Requires
-#     energy_optimizer.py >= v2026.06.10g.
-#   * PRICE HISTORY (rev 3): the price is now drawn as two joined traces —
-#     past from the recorder's state history, future from the attribute data
-#     sliced to "now onward" (one legend entry via legendgroup). Past days no
-#     longer vanish from the plot.
-#   * HARDENED (rev 2): the forecast filters read the sensor's LIVE attributes
-#     via hass.states[...] instead of `meta`, with full guards — if the sensor
-#     does not exist (yet) the traces render as empty instead of throwing and
-#     being dropped, and the read is independent of recorder exclusion. NOTE:
-#     the dotted lines can only appear once sensor.energy_optimizer_forecast
-#     exists (strategy layer ≥ v2026.06.10b deployed AND one strategic cycle
-#     completed since the last HA restart / pyscript reload).
+# Revision history: see CHANGELOG.md → "Dashboard card" (currently rev 4).
 type: custom:plotly-graph
 time_offset: 1d
 refresh_interval: 15s
