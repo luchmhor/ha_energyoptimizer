@@ -6,7 +6,7 @@ cost optimizer plans 15-minute slots over up to 48 h; a fast tactical
 controller executes the plan against real measured grid flow; a Plotly
 dashboard card shows history, the live plan and the price curve in one chart.
 
-**Current version: v2026.06.10f** — the strategy file and the tactical
+**Current version: v2026.06.10j** — the strategy file and the tactical
 automation are version-locked and must always be deployed as a pair.
 
 ---
@@ -152,7 +152,7 @@ Restart HA after adding helpers / recorder changes.
 5. Verify the **load banner** in the HA log — exactly one line:
 
    ```
-   energy_optimizer v2026.06.10f loaded (quiet logging: VERBOSE=False, LOG_DEBUG=False)
+   energy_optimizer v2026.06.10j loaded (quiet logging: VERBOSE=False, LOG_DEBUG=False)
    ```
 
    Two banners with different versions = a duplicate copy is loaded.
@@ -241,7 +241,7 @@ stale by design).
 | Daily records | `/config/www/energy_history/energy-optimizer-YYYY-MM-DD.md` | Refreshed intraday; finalized at 00:01 the next night as an executed-only record of the full day. |
 | Forecast CSV | `/config/www/energy_forecast.csv` | Full 15-min resolution, machine-readable. |
 | InfluxDB | measurement `energy_optimizer_forecast` | Tag `phase` (executed/forecast); `strategy` and `minutes_ahead` are **fields**. Each slot carries its final pre-execution forecast and the executed truth — plan-vs-actual in Grafana is trivial. |
-| Dashboard sensor | `sensor.energy_optimizer_forecast` | `data` attribute with the full slot list (`forecast` flag separates past from planned). Created automatically by the script; exclude from the recorder. |
+| Dashboard sensor | `sensor.energy_optimizer_forecast` | `data` attribute = **future** slots only, compact keys (`t,s,c,p,g,b,pr,so`), auto-thinned to stay under the recorder's 16 KB attribute cap. Created automatically; still best excluded from the recorder. |
 
 ---
 
@@ -268,7 +268,9 @@ price and per-hour PV dumps.
 * **Outlook shows ⚠️ STALE**: the banner names the reason (missing SOC,
   price or PV data). The previous good table is preserved beneath it.
 * **No dotted lines on the card**: the forecast sensor must exist
-  (see step 5); after an HA restart it returns with the first cycle.
+  (see step 5). It is wiped by an HA restart / pyscript reload and is
+  republished automatically by the startup cycle within ~30–120 s (or call
+  `pyscript.energy_optimizer_force_run` to restore it immediately).
 * **Price history range**: the past price trace covers the recorder's
   `purge_keep_days` (default 10). For longer in-card ranges switch that trace
   to `statistic: mean` + `period: auto` (needs long-term statistics on the
