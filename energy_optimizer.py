@@ -3,11 +3,11 @@
 Energy Optimizer — pyscript (HACS) — Strategic planning layer only.
 
 ╔══════════════════════════════════════════════════════════════════════════╗
-║  VERSION: 2026.06.10f (strategy layer)                                     ║
+║  VERSION: 2026.06.10j (strategy layer)                                     ║
 ║  Must be paired with tactical YAML of the SAME version. The two files form ║
 ║  one system: the strategy writes mode_id 0/1/2, the tactical YAML reads it.║
 ║  If the versions differ, redeploy BOTH and reload.                         ║
-║  (2026.06.10a–f change nothing in the tactical contract — mode IDs and     ║
+║  (2026.06.10a–j change nothing in the tactical contract — mode IDs and     ║
 ║  helper entities are unchanged — so the tactical YAML only needs its       ║
 ║  version string bumped to match.)                                          ║
 ║                                                                            ║
@@ -95,6 +95,38 @@ Energy Optimizer — pyscript (HACS) — Strategic planning layer only.
 ║               energy_optimizer" (a compile/load error, e.g. pyscript       ║
 ║               older than 1.4 lacking @pyscript_compile/task.executor       ║
 ║               → update pyscript via HACS). No tactical changes.            ║
+║   2026.06.10g Forecast attribute payload shrunk to stay under the HA       ║
+║               recorder 16 KB cap even if the exclude rule is missing:      ║
+║               only FUTURE rows are published (the card draws only          ║
+║               those; executed history lives in the md/CSV/Influx),         ║
+║               compact short keys (t/f/s/c/p/g/b/pr/so), and an             ║
+║               optional FORECAST_SENSOR_STRIDE to thin slots. Still         ║
+║               recommended to exclude the sensor from the recorder.         ║
+║               CARD CHANGE: forecast filters now read short keys —          ║
+║               redeploy energy_overview_card.yaml. No tactical change.      ║
+║   2026.06.10h Fixes "Unclosed client session" aiohttp errors. The          ║
+║               session was created OUTSIDE the try and closed in the        ║
+║               finally with a bare await; when task.unique cancelled        ║
+║               an overlapping cycle, the CancelledError could abort         ║
+║               that await and strand the open session (GC → error).         ║
+║               Now both entry points use `async with ClientSession()`       ║
+║               which closes deterministically even under cancellation,      ║
+║               and task.unique runs BEFORE the session exists. No           ║
+║               tactical/contract changes.                                   ║
+║   2026.06.10i Two ALWAYS-visible INFO lines per run, independent of        ║
+║               VERBOSE / HA log level: a "cycle start" line and a           ║
+║               "cycle complete" line that reports the resulting             ║
+║               strategy and whether the outlook markdown was written        ║
+║               (✓/✗, threaded back from _log_24h_outlook — it states        ║
+║               the real write result, not just that code finished).         ║
+║               These bypass _dbg() deliberately. No tactical changes.       ║
+║   2026.06.10j Runs one strategic cycle on HA start / pyscript reload       ║
+║               (@time_trigger("startup")) so the forecast sensor — a        ║
+║               state.set entity that does not survive a restart — is        ║
+║               republished within seconds instead of being absent on        ║
+║               the dashboard until the next 15-min cron. A settle           ║
+║               delay + SOC poll let inputs populate first. No tactical      ║
+║               or contract changes.                                         ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 
 Runs every 15 minutes (and on EPEX price update events).
@@ -227,7 +259,7 @@ from scipy.optimize import linprog
 
 # Version of this strategy layer. Must match the tactical YAML's version.
 # Logged on every strategic run so the running version is visible in the log.
-VERSION = "2026.06.10f"
+VERSION = "2026.06.10j"
 
 USE_LP_OPTIMIZER = True
 
@@ -334,6 +366,14 @@ GRID_CHARGE_SOC_CEILING_PCT = 95
 SOC_CRITICAL_PCT = 12.0   # force HOLD when SOC crosses BELOW this
 SOC_RECOVER_PCT  = 15.0   # clear the emergency (and replan) at/above this
 
+# ── Startup cycle timing (2026.06.10j) ────────────────────────────────────
+# After HA (re)start the input entities are briefly 'unknown'; give them time
+# to populate before the first post-boot strategic cycle so it uses real data
+# instead of skipping. These only affect the one-shot startup run.
+STARTUP_SETTLE_S = 30.0   # fixed delay after start before doing anything
+SOC_WAIT_MAX_S   = 90.0   # then poll up to this long for a valid SOC…
+SOC_WAIT_POLL_S  = 5.0    # …at this interval
+
 # ── Legacy constant (heuristic fallback only; the LP ignores it) ───────────
 # (2026.06.10: OPPORTUNITY_COST_WEIGHT and GRID_CHARGE_SOC_CHEAP_PCT were
 #  removed — nothing referenced them — and the duplicate definitions of this
@@ -391,6 +431,13 @@ OUTLOOK_STALE_PREFIX = "> ⚠️ **STALE**"
 #       entities:
 #         - sensor.energy_optimizer_forecast
 E_FORECAST_SENSOR = "sensor.energy_optimizer_forecast"
+# Publish every Nth future slot in the sensor attribute (1 = every slot). The
+# attribute must stay < 16 KB or the recorder refuses to store it (a warning,
+# not a failure — the live state the card reads is unaffected). Future-only +
+# compact keys keep a 48 h horizon well under that; raise to 2 only if you run
+# a very long horizon AND cannot exclude the sensor from the recorder. The
+# CSV / InfluxDB / markdown outputs always keep full resolution.
+FORECAST_SENSOR_STRIDE = 1
 
 def _history_json(day) -> str:
     return f"{HISTORY_DIR}/{day.strftime('%Y-%m-%d')}.json"
@@ -1663,11 +1710,13 @@ def _render_md_table(slots: list, header: str, now_hhmm) -> str:
     return "\n".join(md_lines)
 
 
-async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float, session: aiohttp.ClientSession):
+async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float, session: aiohttp.ClientSession) -> bool:
+    """Returns True iff the main outlook markdown (OUTLOOK_FILE) was written
+    this cycle — used by the always-visible "cycle complete" INFO line."""
     if not schedule or not optimal_schedule:
         _dbg("Outlook: no schedule available")
         await _mark_outlook_stale("No schedule available (missing price or PV data).")
-        return
+        return False
 
     DT    = 0.25
     E_now = soc / 100.0 * BATTERY_SIZE_WH
@@ -1728,7 +1777,7 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float, s
 
     if not slots:
         await _mark_outlook_stale("No forecast rows produced this cycle.")
-        return
+        return False
 
     # ── Prepend today's EXECUTED history (00:00 → now) ────────────────────
     # These rows are what was actually applied earlier today, read back from the
@@ -1742,25 +1791,38 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float, s
     past_slots = _slots_from_history(hist, now_dt, 0, first_qod)
     slots = past_slots + slots
 
-    # ── Publish the forecast as sensor attributes (2026.06.10b) ───────────
-    # Dashboard cards (e.g. plotly-graph) read this exactly like the EPEX
-    # sensor's attribute data: executed rows carry forecast=False, planned
-    # rows forecast=True, so a card can draw dotted lines "from now on" by
-    # filtering on the flag. State value = row count (cheap change detector).
+    # ── Publish the forecast as sensor attributes (2026.06.10b/g) ─────────
+    # Dashboard cards (plotly-graph) read this live from hass.states. To stay
+    # under the recorder's 16 KB attribute cap (2026.06.10g) the payload is:
+    #   • FUTURE rows only — the card's dotted "planned" traces draw only
+    #     these; the executed history is in the md / CSV / InfluxDB outputs;
+    #   • compact short keys (see SCHEMA below) — the field semantics are
+    #     unchanged, only the JSON is smaller;
+    #   • optionally thinned by FORECAST_SENSOR_STRIDE.
+    # SCHEMA (per row): t=ISO time, s=strategy, c=cons_w, p=pv_w, g=grid_w,
+    #   b=batt_w, pr=price_ct, so=soc_pct. (No per-row forecast flag: every
+    #   published row is a forecast.) State value = row count.
     try:
-        attr_rows = []
-        for slot in slots:
-            attr_rows.append({
-                "time":     slot["time"].isoformat(),
-                "forecast": bool(slot.get("forecast", True)),
-                "strategy": slot.get("mode", ""),
-                "cons_w":   round(slot["cons_w"], 0),
-                "pv_w":     round(slot["pv_w"], 0),
-                "grid_w":   round(slot["grid_w"], 0),
-                "batt_w":   int(slot["batt_w"]),
-                "price_ct": round(slot["price"] * 100, 2),
-                "soc_pct":  round(slot["soc_pct"], 1),
-            })
+        fut = [s for s in slots if s.get("forecast", True)]
+        # Auto-thin to stay under the 16 KB recorder cap on very long horizons.
+        # ~120 B/row compact → ~125 rows fit; beyond that, take every Nth slot
+        # (the near-term plan keeps full 15-min detail, only the far tail
+        # coarsens). The explicit FORECAST_SENSOR_STRIDE is honoured as a floor.
+        stride = max(1, FORECAST_SENSOR_STRIDE)
+        if len(fut) // stride > 120:
+            stride = max(stride, -(-len(fut) // 120))   # ceil division
+        if stride > 1:
+            fut = fut[::stride]
+        attr_rows = [{
+            "t":  s["time"].isoformat(),
+            "s":  s.get("mode", ""),
+            "c":  round(s["cons_w"], 0),
+            "p":  round(s["pv_w"], 0),
+            "g":  round(s["grid_w"], 0),
+            "b":  int(s["batt_w"]),
+            "pr": round(s["price"] * 100, 2),
+            "so": round(s["soc_pct"], 1),
+        } for s in fut]
         state.set(
             E_FORECAST_SENSOR,
             value=len(attr_rows),
@@ -1769,10 +1831,22 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float, s
                 "icon": "mdi:chart-timeline-variant",
                 "updated": now_dt.isoformat(),
                 "version": VERSION,
+                "schema": "t,s,c,p,g,b,pr,so;future-only;v2026.06.10g",
                 "data": attr_rows,
             },
         )
-        _dbg(f"Forecast sensor published ({len(attr_rows)} rows)")
+        # Guard rail: log the serialized size so an oversized payload is
+        # diagnosable from the log rather than only from the recorder warning.
+        try:
+            import json as _json
+            sz = len(_json.dumps(attr_rows))
+            if sz > 15000:
+                _warn("forecast_size",
+                      f"Forecast attribute is {sz} B (recorder cap 16384) — "
+                      f"raise FORECAST_SENSOR_STRIDE or exclude the sensor.")
+            _dbg(f"Forecast sensor published ({len(attr_rows)} future rows, {sz} B)")
+        except Exception:
+            _dbg(f"Forecast sensor published ({len(attr_rows)} future rows)")
     except Exception as exc:
         _warn("forecast_sensor", f"Could not publish forecast sensor: {exc}")
 
@@ -1788,7 +1862,8 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float, s
         f"_(updated {now_str}, v{VERSION})_"
     )
     content = _render_md_table(slots, header, now_dt.strftime("%H:%M"))
-    if await _write_text_file(OUTLOOK_FILE, content):
+    outlook_written = await _write_text_file(OUTLOOK_FILE, content)
+    if outlook_written:
         _dbg(f"Outlook written to {OUTLOOK_FILE}")
 
     # ── Refresh today's rotated daily markdown (intraday view) ─────────────
@@ -1878,6 +1953,8 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float, s
     except Exception as exc:
         _warn("influx_forecast", f"Could not write forecast to InfluxDB: {exc}")
 
+    return outlook_written
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # STRATEGIC LAYER — runs every 15 minutes
@@ -1891,152 +1968,178 @@ async def strategic_optimize():
     # previously-started instance so they don't race on _ctx / file writes.
     # (A cancelled instance aborts its pending outlook write — the surviving
     # newer run produces the fresh one, which is exactly what we want.)
+    # task.unique cancels any previously-started instance so cron, the EPEX
+    # state-trigger and the manual service don't race on _ctx / file writes.
+    # It MUST run before the session is created: cancelling an overlapping
+    # instance raises CancelledError at its current await, and if that happened
+    # with a manually-managed session open, the close could be skipped and the
+    # session leaked ("Unclosed client session"). With task.unique first and
+    # the session in an `async with`, closure is deterministic even on cancel.
     task.unique("energy_optimizer_strategic")
     _ctx["last_cycle_ts"] = datetime.now(timezone.utc).timestamp()
 
+    # Always-visible run markers (2026.06.10i): these two log.info lines are
+    # emitted regardless of VERBOSE or HA log level, so the log always shows
+    # that the cycle started and how it ended (strategy + whether the outlook
+    # markdown was written). They intentionally bypass _dbg().
+    log.info(f"Strategic cycle START (v{VERSION})")
+
     _dbg(f"── Strategic cycle v{VERSION} ({'LP' if USE_LP_OPTIMIZER else 'Heuristic'}) ──")
-    session = aiohttp.ClientSession()
     # Defined up-front so the finally-block outlook write is always safe, even if
     # the cycle raises before they are assigned.
     schedule = []
     optimal_schedule = []
     soc = 0.0
     skip_reason = ""
-    try:
-        soc_raw = state.get(E_BATTERY_SOC)
-        if soc_raw in (None, "unavailable", "unknown"):
-            skip_reason = "Battery SOC unavailable — cycle skipped."
-            _warn("soc_unavailable", "Battery SOC unavailable — skipping cycle")
-            return
-        soc = float(soc_raw)
+    outlook_ok = False
+    final_mode = "—"
+    async with aiohttp.ClientSession() as session:
+      try:
+          soc_raw = state.get(E_BATTERY_SOC)
+          if soc_raw in (None, "unavailable", "unknown"):
+              skip_reason = "Battery SOC unavailable — cycle skipped."
+              _warn("soc_unavailable", "Battery SOC unavailable — skipping cycle")
+              return
+          soc = float(soc_raw)
 
-        # Clear a stale emergency flag if the recovery state-trigger was missed
-        # (HA restart, sensor gap, …).
-        if _ctx.get("soc_emergency") and soc >= SOC_RECOVER_PCT:
-            _ctx["soc_emergency"] = False
-            persistent_notification.dismiss(notification_id="energy_optimizer_critical")
-            log.info(f"SOC emergency cleared by strategic cycle ({soc:.0f}% ≥ {SOC_RECOVER_PCT:.0f}%)")
-        # NOTE: while the emergency IS active (SOC between critical and recover)
-        # this cycle still runs — that is safe by construction: the LP clamps
-        # its floor to the current SOC (E_min_eff), so it cannot plan any net
-        # discharge; the strategy it produces can only be HOLD or GRID_CHARGE.
+          # Clear a stale emergency flag if the recovery state-trigger was missed
+          # (HA restart, sensor gap, …).
+          if _ctx.get("soc_emergency") and soc >= SOC_RECOVER_PCT:
+              _ctx["soc_emergency"] = False
+              persistent_notification.dismiss(notification_id="energy_optimizer_critical")
+              log.info(f"SOC emergency cleared by strategic cycle ({soc:.0f}% ≥ {SOC_RECOVER_PCT:.0f}%)")
+          # NOTE: while the emergency IS active (SOC between critical and recover)
+          # this cycle still runs — that is safe by construction: the LP clamps
+          # its floor to the current SOC (E_min_eff), so it cannot plan any net
+          # discharge; the strategy it produces can only be HOLD or GRID_CHARGE.
 
-        consumption = await _fetch_historical_consumption(session)
-        actuals     = await _get_solar_actuals(session)
-        solar       = _get_solar_forecast(actuals)
-        prices      = _get_spot_prices()
+          consumption = await _fetch_historical_consumption(session)
+          actuals     = await _get_solar_actuals(session)
+          solar       = _get_solar_forecast(actuals)
+          prices      = _get_spot_prices()
 
-        if LOG_DEBUG and prices:
-            _dbg("── EPEX prices (incl. network fee) ──")
-            # Keys are uniformly (date, hour, quarter) since 2026.06.10 — the
-            # fallback curve is date-keyed too.
-            for k, p in sorted(prices.items(), key=lambda kv: kv[0]):
-                d, h, q = k
-                _dbg(f"  {d} {h:02d}:{q * 15:02d}  {p * 100:.3f} ct/kWh")
-            _dbg("─────────────────────────────────────")
+          if LOG_DEBUG and prices:
+              _dbg("── EPEX prices (incl. network fee) ──")
+              # Keys are uniformly (date, hour, quarter) since 2026.06.10 — the
+              # fallback curve is date-keyed too.
+              for k, p in sorted(prices.items(), key=lambda kv: kv[0]):
+                  d, h, q = k
+                  _dbg(f"  {d} {h:02d}:{q * 15:02d}  {p * 100:.3f} ct/kWh")
+              _dbg("─────────────────────────────────────")
 
-        if not prices:
-            skip_reason = "No price data available — cycle skipped."
-            _warn("epex_missing", "No EPEX price data — mode unchanged")
-            return
+          if not prices:
+              skip_reason = "No price data available — cycle skipped."
+              _warn("epex_missing", "No EPEX price data — mode unchanged")
+              return
 
-        schedule         = _build_schedule(consumption, solar, prices)
-        optimal_schedule = _get_schedule(soc, schedule)
-        _ctx["last_schedule"] = optimal_schedule
+          schedule         = _build_schedule(consumption, solar, prices)
+          optimal_schedule = _get_schedule(soc, schedule)
+          _ctx["last_schedule"] = optimal_schedule
 
-        raw_sp = optimal_schedule[0] if optimal_schedule else 0
-        price  = schedule[0]["price"] if schedule else 0.15
-        pv0    = schedule[0]["solar"] if schedule else 0.0
-        load0  = schedule[0]["cons"]  if schedule else 0.0
+          raw_sp = optimal_schedule[0] if optimal_schedule else 0
+          price  = schedule[0]["price"] if schedule else 0.15
+          pv0    = schedule[0]["solar"] if schedule else 0.0
+          load0  = schedule[0]["cons"]  if schedule else 0.0
 
-        # The strategy IS the sign of the LP's slot-0 plan — no extra heuristics.
-        mode, sp = _decide_mode(raw_sp, pv0, load0)
-        _write_outputs(mode, sp)
+          # The strategy IS the sign of the LP's slot-0 plan — no extra heuristics.
+          mode, sp = _decide_mode(raw_sp, pv0, load0)
+          final_mode = mode
+          _write_outputs(mode, sp)
 
-        p75 = _ctx.get("p75", 0.20)
+          p75 = _ctx.get("p75", 0.20)
 
-        if mode == "HOLD":
-            pv_note = " PV is charging the battery meanwhile." if pv0 > GRID_DEADZONE_W else ""
-            if soc <= BATTERY_EMPTY_PCT:
-                reason = (
-                    f"Battery at floor ({soc:.0f}%). Idle, importing load from grid; "
-                    f"no discharge. Price: {price * 100:.1f} ct/kWh.{pv_note}"
-                )
-            else:
-                reason = (
-                    f"Holding: limited battery (SOC {soc:.0f}%) and a pricier peak "
-                    f"ahead. Importing from grid now ({price * 100:.1f} ct/kWh) to "
-                    f"save charge for the peak.{pv_note}"
-                )
-        elif mode == "GRID_CHARGE":
-            reason = (
-                f"Charging from grid at {price * 100:.1f} ct/kWh (cheap relative to "
-                f"the upcoming peak). SOC: {soc:.0f}%."
-            )
-        else:  # FOLLOW_GRID
-            if soc >= BATTERY_FULL_PCT:
-                reason = (
-                    f"Battery full ({soc:.0f}%). Covering load from battery / routing "
-                    f"PV to the home bus. Price: {price * 100:.1f} ct/kWh."
-                )
-            elif price >= p75:
-                reason = (
-                    f"Covering load from battery at peak price "
-                    f"({price * 100:.1f} ct ≥ P75 {p75 * 100:.1f} ct). SOC: {soc:.0f}%."
-                )
-            else:
-                reason = (
-                    f"Covering load from battery (self-consumption) at "
-                    f"{price * 100:.1f} ct/kWh. SOC: {soc:.0f}%."
-                )
+          if mode == "HOLD":
+              pv_note = " PV is charging the battery meanwhile." if pv0 > GRID_DEADZONE_W else ""
+              if soc <= BATTERY_EMPTY_PCT:
+                  reason = (
+                      f"Battery at floor ({soc:.0f}%). Idle, importing load from grid; "
+                      f"no discharge. Price: {price * 100:.1f} ct/kWh.{pv_note}"
+                  )
+              else:
+                  reason = (
+                      f"Holding: limited battery (SOC {soc:.0f}%) and a pricier peak "
+                      f"ahead. Importing from grid now ({price * 100:.1f} ct/kWh) to "
+                      f"save charge for the peak.{pv_note}"
+                  )
+          elif mode == "GRID_CHARGE":
+              reason = (
+                  f"Charging from grid at {price * 100:.1f} ct/kWh (cheap relative to "
+                  f"the upcoming peak). SOC: {soc:.0f}%."
+              )
+          else:  # FOLLOW_GRID
+              if soc >= BATTERY_FULL_PCT:
+                  reason = (
+                      f"Battery full ({soc:.0f}%). Covering load from battery / routing "
+                      f"PV to the home bus. Price: {price * 100:.1f} ct/kWh."
+                  )
+              elif price >= p75:
+                  reason = (
+                      f"Covering load from battery at peak price "
+                      f"({price * 100:.1f} ct ≥ P75 {p75 * 100:.1f} ct). SOC: {soc:.0f}%."
+                  )
+              else:
+                  reason = (
+                      f"Covering load from battery (self-consumption) at "
+                      f"{price * 100:.1f} ct/kWh. SOC: {soc:.0f}%."
+                  )
 
-        _update_status(mode, reason)
+          _update_status(mode, reason)
 
-        # Record this slot as ACTUALLY EXECUTED so the outlook can show the
-        # realised part of the day (00:00 → now). Uses the SAME per-mode power
-        # model as the outlook (_mode_power_flows), so history and plan agree
-        # on what each mode does — including HOLD's full-load import.
-        now_slot   = datetime.now(TZ)
-        peak_ahead = max([s["price"] for s in schedule[1:]] or [price]) if schedule else price
-        short_reason = _strategy_reason(mode, price, pv0, load0, soc, peak_ahead)
-        hist_batt, hist_grid = _mode_power_flows(mode, sp, load0, pv0)
-        await _record_executed_slot(now_slot, mode, short_reason, price,
-                                    load0, pv0, hist_grid, hist_batt, soc)
+          # Record this slot as ACTUALLY EXECUTED so the outlook can show the
+          # realised part of the day (00:00 → now). Uses the SAME per-mode power
+          # model as the outlook (_mode_power_flows), so history and plan agree
+          # on what each mode does — including HOLD's full-load import.
+          now_slot   = datetime.now(TZ)
+          peak_ahead = max([s["price"] for s in schedule[1:]] or [price]) if schedule else price
+          short_reason = _strategy_reason(mode, price, pv0, load0, soc, peak_ahead)
+          hist_batt, hist_grid = _mode_power_flows(mode, sp, load0, pv0)
+          await _record_executed_slot(now_slot, mode, short_reason, price,
+                                      load0, pv0, hist_grid, hist_batt, soc)
 
-        # One INFO line per STRATEGY CHANGE (a handful per day); unchanged-
-        # strategy cycles log the same summary only as a diagnostic.
-        summary = (
-            f"Mode={mode} | SOC={soc:.0f}% | "
-            f"Price={price * 100:.1f} ct | "
-            f"LP={raw_sp:+d}W → Applied={sp:+d}W"
-        )
-        if mode != _ctx.get("last_logged_mode"):
-            _ctx["last_logged_mode"] = mode
-            log.info(summary)
-        else:
-            _dbg(summary)
+          # One INFO line per STRATEGY CHANGE (a handful per day); unchanged-
+          # strategy cycles log the same summary only as a diagnostic.
+          summary = (
+              f"Mode={mode} | SOC={soc:.0f}% | "
+              f"Price={price * 100:.1f} ct | "
+              f"LP={raw_sp:+d}W → Applied={sp:+d}W"
+          )
+          if mode != _ctx.get("last_logged_mode"):
+              _ctx["last_logged_mode"] = mode
+              log.info(summary)
+          else:
+              _dbg(summary)
 
-    except Exception as exc:
-        import traceback
-        skip_reason = f"Strategic error: {exc}"
-        log.error(f"Strategic error: {exc}\n{traceback.format_exc()}")
-    finally:
-        # Always leave the outlook file in a known state — but never wipe a good
-        # table on a bad cycle (fix 2026.06.10): a full schedule rewrites it,
-        # anything less marks the existing one STALE with the reason.
-        try:
-            if schedule and optimal_schedule:
-                await _log_24h_outlook(schedule, optimal_schedule, soc, session)
-            else:
-                await _mark_outlook_stale(skip_reason or "No schedule produced this cycle.")
-        except Exception as exc:
-            import traceback
-            _warn("outlook_write", f"Outlook write failed: {exc}\n{traceback.format_exc()}")
-            try:
-                await _mark_outlook_stale(f"Outlook generation failed: {exc}")
-            except Exception:
-                pass
-        await session.close()
+      except Exception as exc:
+          import traceback
+          skip_reason = f"Strategic error: {exc}"
+          log.error(f"Strategic error: {exc}\n{traceback.format_exc()}")
+      finally:
+          # Always leave the outlook file in a known state — but never wipe a good
+          # table on a bad cycle (fix 2026.06.10): a full schedule rewrites it,
+          # anything less marks the existing one STALE with the reason.
+          try:
+              if schedule and optimal_schedule:
+                  outlook_ok = await _log_24h_outlook(schedule, optimal_schedule, soc, session)
+              else:
+                  await _mark_outlook_stale(skip_reason or "No schedule produced this cycle.")
+                  outlook_ok = False
+          except Exception as exc:
+              import traceback
+              _warn("outlook_write", f"Outlook write failed: {exc}\n{traceback.format_exc()}")
+              outlook_ok = False
+              try:
+                  await _mark_outlook_stale(f"Outlook generation failed: {exc}")
+              except Exception:
+                  pass
+          # Always-visible completion line (2026.06.10i): bypasses _dbg() so it
+          # appears at any log level. Reports the resulting strategy and the
+          # real outlook-write result, or the skip/error reason.
+          if skip_reason:
+              log.info(f"Strategic cycle COMPLETE — {skip_reason} "
+                       f"(outlook md: {'written' if outlook_ok else 'stale/not written'})")
+          else:
+              log.info(f"Strategic cycle COMPLETE — strategy={final_mode}, "
+                       f"outlook md: {'written ✓' if outlook_ok else 'NOT written ✗'}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -2114,6 +2217,42 @@ async def midnight_finalize():
                 _dbg(f"History pruned: {len(removed)} files removed")
         except Exception as exc:
             log.warning(f"History pruning failed: {exc}")
+
+
+@time_trigger("startup")
+async def on_ha_start():
+    """Run one strategic cycle shortly after Home Assistant has started, so the
+    dashboard forecast sensor (sensor.energy_optimizer_forecast) — which is
+    created by state.set and does NOT survive a restart — is republished
+    immediately instead of being absent until the next 15-min cron tick.
+
+    Two guards make this robust on a cold boot:
+      • a short settle delay, because right after start the input entities
+        (SOC, EPEX, Solcast) are often still 'unknown' and a cycle would just
+        skip with "Battery SOC unavailable";
+      • a brief poll for a valid SOC (up to ~SOC_WAIT_MAX_S) before running, so
+        the first post-boot plan uses real data rather than skipping.
+    If SOC never becomes valid in time we still call the cycle once: it will
+    skip cleanly and the normal cron will retry, exactly as before.
+
+    `time_trigger("startup")` fires once per (re)load — both on an HA restart
+    and on a pyscript reload — which is precisely when the sensor was wiped.
+    """
+    _ensure_tz()
+    import asyncio
+    await asyncio.sleep(STARTUP_SETTLE_S)
+
+    waited = 0.0
+    while waited < SOC_WAIT_MAX_S:
+        soc_raw = state.get(E_BATTERY_SOC)
+        if soc_raw not in (None, "unavailable", "unknown"):
+            break
+        await asyncio.sleep(SOC_WAIT_POLL_S)
+        waited += SOC_WAIT_POLL_S
+
+    log.info(f"HA start detected — running initial strategic cycle "
+             f"(waited {waited:.0f}s for inputs)")
+    await strategic_optimize()
 
 
 @state_trigger(E_PRICE_DATA)
@@ -2245,14 +2384,12 @@ async def energy_optimizer_self_test():
     except Exception as exc:
         lines.append(f"state.set → sensor: ✗ ERROR {exc}")
 
-    session = aiohttp.ClientSession()
-    try:
-        await _influx_query("SHOW DATABASES", session)
-        lines.append("InfluxDB: ✓ reachable")
-    except Exception as exc:
-        lines.append(f"InfluxDB: ✗ {exc}")
-    finally:
-        await session.close()
+    async with aiohttp.ClientSession() as session:
+        try:
+            await _influx_query("SHOW DATABASES", session)
+            lines.append("InfluxDB: ✓ reachable")
+        except Exception as exc:
+            lines.append(f"InfluxDB: ✗ {exc}")
 
     pre = _safe_get(E_FORECAST_SENSOR)
     pre_ok = pre not in (None, "unknown", "unavailable")
