@@ -53,59 +53,7 @@ description: >
       could be written anyway).
     * Final setpoint hard-clamped to [abs_max_charge, abs_max_dis].
 
-  Changelog v2026.06.10j:
-    * Version bump only — strategy layer now runs one cycle on HA start /
-      reload (republishes the dashboard forecast sensor immediately). No
-      tactical changes.
-
-  Changelog v2026.06.10i:
-    * Version bump only — strategy layer added two always-visible INFO log
-      lines per run (cycle start + completion). No tactical changes.
-
-  Changelog v2026.06.10h:
-    * Version bump only — strategy layer fixed an aiohttp "Unclosed client
-      session" leak under cancellation. No tactical changes.
-
-  Changelog v2026.06.10g:
-    * Version bump only — strategy layer shrank the dashboard forecast sensor
-      payload (recorder 16 KB cap). No tactical changes.
-
-  Changelog v2026.06.10f:
-    * Version bump only — strategy layer added the
-      pyscript.energy_optimizer_self_test diagnostic service. No tactical
-      changes.
-
-  Changelog v2026.06.10e:
-    * Version bump only — strategy layer added a one-line load banner as a
-      deployment beacon. No tactical changes.
-
-  Changelog v2026.06.10d:
-    * Version bump only — strategy layer made its logging self-gated (quiet
-      regardless of HA `logger:` configuration), rate-limited its warnings
-      and debounced the EPEX trigger. No tactical changes.
-
-  Changelog v2026.06.10c:
-    * Version bump only — strategy layer quieted its logging and rotates the
-      daily markdown (energy-optimizer-YYYY-MM-DD.md, finalized nightly).
-      No tactical changes; the control contract is identical.
-
-  Changelog v2026.06.10b:
-    * Version bump only — the strategy layer now publishes
-      sensor.energy_optimizer_forecast for dashboard cards. No tactical
-      changes; the control contract (mode IDs, helpers) is identical.
-
-  Changelog v2026.06.10a:
-    * Fixed the stale "Mode behaviour" table (see FIX note above).
-    * Removed dead TRICKLE-era variables (pv_w, batt_w, soc_full,
-      soc_trickle_start, trickle_charge) and the obsolete batt_w sign note —
-      they were evaluated every 5 s and used nowhere.
-    * GRID_CHARGE now respects soc_grid_ceiling (95 %, 1 % hysteresis via
-      grid_charge_blocked) instead of charging at full rate until the next
-      strategic replan.
-    * Sensor failsafes as described under Safety; the availability gate is
-      reduced to the inverter entity.
-    * Shared idle_target ramp used by HOLD, the ceiling stop, the sensor
-      failsafe and the unknown-mode default.
+  Full version history: see CHANGELOG.md.
 
   Constants below marked "must match" mirror energy_optimizer.py — change them
   in BOTH files or not at all.
