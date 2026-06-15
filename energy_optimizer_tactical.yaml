@@ -1,6 +1,6 @@
-alias: Energy Optimizer — Tactical Control (v2026.06.10f)
+alias: Energy Optimizer — Tactical Control (v2026.06.10j)
 description: >
-  v2026.06.10f — must match energy_optimizer.py (strategy layer) version.
+  v2026.06.10j — must match energy_optimizer.py (strategy layer) version.
   Runs every 5 seconds. Reads ONLY the strategy (mode_id 0–2: 0=FOLLOW_GRID,
   1=HOLD, 2=GRID_CHARGE) from the optimizer and runs a proportional grid-
   following controller to the hardware limits. The numeric strategic setpoint
@@ -52,6 +52,23 @@ description: >
     * Cycle skipped only if the inverter entity itself is unavailable (nothing
       could be written anyway).
     * Final setpoint hard-clamped to [abs_max_charge, abs_max_dis].
+
+  Changelog v2026.06.10j:
+    * Version bump only — strategy layer now runs one cycle on HA start /
+      reload (republishes the dashboard forecast sensor immediately). No
+      tactical changes.
+
+  Changelog v2026.06.10i:
+    * Version bump only — strategy layer added two always-visible INFO log
+      lines per run (cycle start + completion). No tactical changes.
+
+  Changelog v2026.06.10h:
+    * Version bump only — strategy layer fixed an aiohttp "Unclosed client
+      session" leak under cancellation. No tactical changes.
+
+  Changelog v2026.06.10g:
+    * Version bump only — strategy layer shrank the dashboard forecast sensor
+      payload (recorder 16 KB cap). No tactical changes.
 
   Changelog v2026.06.10f:
     * Version bump only — strategy layer added the
