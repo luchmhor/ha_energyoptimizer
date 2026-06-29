@@ -3,11 +3,11 @@
 Energy Optimizer — pyscript (HACS) — Strategic planning layer only.
 
 ╔══════════════════════════════════════════════════════════════════════════╗
-║  VERSION: 2026.06.10j (strategy layer)                                     ║
+║  VERSION: 2026.06.10k (strategy layer)                                     ║
 ║  Must be paired with tactical YAML of the SAME version. The two files form ║
 ║  one system: the strategy writes mode_id 0/1/2, the tactical YAML reads it.║
 ║  If the versions differ, redeploy BOTH and reload.                         ║
-║  (2026.06.10a–j change nothing in the tactical contract — mode IDs and     ║
+║  (2026.06.10a–k change nothing in the tactical contract — mode IDs and     ║
 ║  helper entities are unchanged — so the tactical YAML only needs its       ║
 ║  version string bumped to match.)                                          ║
 ║                                                                            ║
@@ -146,7 +146,7 @@ from scipy.optimize import linprog
 
 # Version of this strategy layer. Must match the tactical YAML's version.
 # Logged on every strategic run so the running version is visible in the log.
-VERSION = "2026.06.10j"
+VERSION = "2026.06.10k"
 
 USE_LP_OPTIMIZER = True
 
@@ -239,6 +239,19 @@ PV_NAMEPLATE_WP = 1200   # nameplate peak power in Wp (informational only —
 # energy, so the optimizer over-banks slightly. Set 0.5 (median) to A/B the
 # bias against realised cost.
 CONSUMPTION_QUANTILE = 0.75
+
+# Smoothing of the per-slot consumption profile (2026.06.10k). The profile is a
+# per-15-min quantile over only 4 same-weekday samples, so it is NOISY — a slot
+# that happened to see a high-load event in 2 of 4 past weeks spikes while its
+# neighbours stay low, producing a sawtooth (e.g. 130→743→99→1176 W in
+# consecutive slots). That noise makes the chosen strategy flip-flop
+# (FOLLOW_GRID/HOLD) between adjacent slots as the jagged load crosses the PV
+# line, even though the house's real load does not swing that fast. A centered
+# moving average over CONSUMPTION_SMOOTH_SLOTS quarter-hours (must be odd; 1 =
+# off) calms this without biasing the daily total. Smoothing runs ALONG TIME
+# within each weekday and wraps across hour/day boundaries. It does not change
+# any optimizer logic — only the input load series.
+CONSUMPTION_SMOOTH_SLOTS = 3   # 3 = ±1 slot (45-min window); 5 = ±2; 1 = off
 
 # SOC safety ceiling for GRID charging (not PV). Physical protection only — the
 # economics are handled by the objective. ENFORCED since 2026.06.10 as a linear
@@ -473,6 +486,38 @@ async def _influx_query(q: str, session: aiohttp.ClientSession) -> dict:
         return await resp.json(content_type=None)
 
 
+def _smooth_consumption_profile(profile: dict) -> dict:
+    """Centered moving average of the (weekday, hour, quarter)-keyed consumption
+    profile along the time axis, within each weekday, wrapping across hour and
+    day-of-week boundaries (slot (wd,h,3) is followed by (wd,h+1,0); the last
+    quarter of a weekday wraps to the first quarter of the same weekday — a
+    cyclic 24 h day, which is what the planner sees). Window =
+    CONSUMPTION_SMOOTH_SLOTS (odd). Missing neighbours are skipped, so the
+    average is over whatever real slots exist. Returns a NEW dict; the daily
+    total per weekday is preserved up to edge effects of skipped slots."""
+    w = CONSUMPTION_SMOOTH_SLOTS
+    if w <= 1 or not profile:
+        return profile
+    half = w // 2
+    # Index each weekday's 96 quarter-of-day slots for O(1) neighbour lookup.
+    # qod = hour*4 + quarter, 0..95, cyclic within the weekday.
+    by_wd = {}
+    for (wd, h, q), v in profile.items():
+        by_wd.setdefault(wd, {})[h * 4 + q] = v
+    out = {}
+    for (wd, h, q), _ in profile.items():
+        qod = h * 4 + q
+        acc, n = 0.0, 0
+        for d in range(-half, half + 1):
+            nb = (qod + d) % 96
+            val = by_wd[wd].get(nb)
+            if val is not None:
+                acc += val
+                n += 1
+        out[(wd, h, q)] = acc / n if n else profile[(wd, h, q)]
+    return out
+
+
 async def _fetch_historical_consumption(session: aiohttp.ClientSession) -> dict:
     """
     Return {(weekday, hour, quarter): watts} for every weekday the planning
@@ -548,10 +593,14 @@ async def _fetch_historical_consumption(session: aiohttp.ClientSession) -> dict:
                          int(CONSUMPTION_QUANTILE * (len(sorted_vals) - 1))))
         result[k] = sorted_vals[idx]
 
+    if CONSUMPTION_SMOOTH_SLOTS > 1:
+        result = _smooth_consumption_profile(result)
+
     _ctx["cons_cache"] = {"day": today, "profile": result}
     _dbg(
         f"Consumption profile rebuilt: weekdays {weekdays_done}, "
-        f"{len(result)} slots, q{int(CONSUMPTION_QUANTILE * 100)} (cached for today)"
+        f"{len(result)} slots, q{int(CONSUMPTION_QUANTILE * 100)}, "
+        f"smooth={CONSUMPTION_SMOOTH_SLOTS} (cached for today)"
     )
     return result
 
