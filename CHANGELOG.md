@@ -10,6 +10,12 @@ dashboard card has its own revision track (it reads the strategy layer's
 output but has no control role); the **Dashboard card** section at the end
 records its changes.
 
+## 2026.06.10k
+
+Smooths the historical consumption profile with a centered moving average (`CONSUMPTION_SMOOTH_SLOTS`, default 3 = ±1 slot / 45-min window) before it feeds the planner. The profile is a per-15-min quantile over only 4 same-weekday samples and was therefore noisy — a slot that saw a high-load event in 2 of 4 past weeks spiked while its neighbours stayed low (e.g. 130→743→99→1176 W in consecutive slots). That sawtooth made the chosen strategy flip-flop between FOLLOW_GRID and HOLD as the jagged load crossed the PV line, even though real house load does not swing that fast. Smoothing runs along time within each weekday, wraps across hour/day boundaries, and preserves the daily total; it changes only the input load series, no optimizer logic. Set `CONSUMPTION_SMOOTH_SLOTS = 1` to disable. No tactical or contract changes.
+
+_Tactical: version bump only — no control-contract change._
+
 ## 2026.06.10j
 
 Runs one strategic cycle on HA start / pyscript reload (@time_trigger("startup")) so the forecast sensor — a state.set entity that does not survive a restart — is republished within seconds instead of being absent on the dashboard until the next 15-min cron. A settle delay + SOC poll let inputs populate first. No tactical or contract changes.
