@@ -1,6 +1,6 @@
-alias: Energy Optimizer — Tactical Control (v2026.06.10j)
+alias: Energy Optimizer — Tactical Control (v2026.06.10k)
 description: >
-  v2026.06.10j — must match energy_optimizer.py (strategy layer) version.
+  v2026.06.10k — must match energy_optimizer.py (strategy layer) version.
   Runs every 5 seconds. Reads ONLY the strategy (mode_id 0–2: 0=FOLLOW_GRID,
   1=HOLD, 2=GRID_CHARGE) from the optimizer and runs a proportional grid-
   following controller to the hardware limits. The numeric strategic setpoint
