@@ -10,6 +10,18 @@ dashboard card has its own revision track (it reads the strategy layer's
 output but has no control role); the **Dashboard card** section at the end
 records its changes.
 
+## 2026.06.10m
+
+Refines the AC adjustment (v…l) for this apartment's behaviour: cooling base temperature raised to 30 °C (cooling only needed above ~30 °C), and a consecutive-day **heat-soak** factor added. A single hot day barely warms the building; on the 2nd/3rd hot day it is heat-soaked and the AC works harder for the same outdoor temperature. The driver is the overnight low: a cool night sheds stored heat and resets, a warm night carries it forward. An accumulation index `A` is built from recent actual overnight minima (InfluxDB, `SOAK_LOOKBACK_DAYS` nights) extended by tonight's forecast low, decayed each night by `SOAK_DECAY`; `soak_mult = 1 + SOAK_GAIN·A` amplifies the FORECAST cooling-degrees only (raises today's projected load; the historical baseline is left unamplified, a deliberate, bounded simplification). Constants: `NIGHT_RESET_C` 20 °C, `SOAK_DECAY` 0.5, `SOAK_GAIN` 0.04 (≈×1.16 after one warm night, ≈×1.30 on a sustained heatwave — tune/measure to your building), night window 22:00–07:00. Disable via `AC_HEAT_SOAK_ENABLE`. No tactical or contract changes.
+
+_Tactical: version bump only — no control-contract change._
+
+## 2026.06.10l
+
+Optional temperature-dependent AC adjustment of the consumption forecast (`AC_TEMP_ENABLE`, default on). On hot days the apartment needs cooling, but the historical profile already contains the AC load of the past sample days' weather — so the adjustment is by the per-hour *cooling-degree difference* between the Met.no forecast (`weather.forecast_home`, fetched via `weather.get_forecasts`) and the historical outdoor temperature (InfluxDB `outdoor_temperature`), not by raw temperature. `CDD(T)=max(0,T-AC_BASE_TEMP_C)`; `extra_W = clamp(AC_GAIN_W_PER_CDD · (CDD_forecast - CDD_hist), ±AC_MAX_BONUS_W)`. A forecast matching history changes nothing; hotter raises the load, cooler lowers it (removing baked-in AC); below the base temperature nothing accrues. Applied per hour before smoothing; any missing temperature data skips the adjustment for that cycle. Constants: `AC_BASE_TEMP_C` 22, `AC_GAIN_W_PER_CDD` 60 W/°C (tune/measure to your unit), `AC_MAX_BONUS_W` 1500. No tactical or contract changes.
+
+_Tactical: version bump only — no control-contract change._
+
 ## 2026.06.10k
 
 Smooths the historical consumption profile with a centered moving average (`CONSUMPTION_SMOOTH_SLOTS`, default 3 = ±1 slot / 45-min window) before it feeds the planner. The profile is a per-15-min quantile over only 4 same-weekday samples and was therefore noisy — a slot that saw a high-load event in 2 of 4 past weeks spiked while its neighbours stayed low (e.g. 130→743→99→1176 W in consecutive slots). That sawtooth made the chosen strategy flip-flop between FOLLOW_GRID and HOLD as the jagged load crossed the PV line, even though real house load does not swing that fast. Smoothing runs along time within each weekday, wraps across hour/day boundaries, and preserves the daily total; it changes only the input load series, no optimizer logic. Set `CONSUMPTION_SMOOTH_SLOTS = 1` to disable. No tactical or contract changes.
