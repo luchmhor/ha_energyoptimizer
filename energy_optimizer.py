@@ -3,11 +3,11 @@
 Energy Optimizer — pyscript (HACS) — Strategic planning layer only.
 
 ╔══════════════════════════════════════════════════════════════════════════╗
-║  VERSION: 2026.06.10k (strategy layer)                                     ║
+║  VERSION: 2026.06.10m (strategy layer)                                     ║
 ║  Must be paired with tactical YAML of the SAME version. The two files form ║
 ║  one system: the strategy writes mode_id 0/1/2, the tactical YAML reads it.║
 ║  If the versions differ, redeploy BOTH and reload.                         ║
-║  (2026.06.10a–k change nothing in the tactical contract — mode IDs and     ║
+║  (2026.06.10a–m change nothing in the tactical contract — mode IDs and     ║
 ║  helper entities are unchanged — so the tactical YAML only needs its       ║
 ║  version string bumped to match.)                                          ║
 ║                                                                            ║
@@ -146,7 +146,7 @@ from scipy.optimize import linprog
 
 # Version of this strategy layer. Must match the tactical YAML's version.
 # Logged on every strategic run so the running version is visible in the log.
-VERSION = "2026.06.10k"
+VERSION = "2026.06.10m"
 
 USE_LP_OPTIMIZER = True
 
@@ -252,6 +252,81 @@ CONSUMPTION_QUANTILE = 0.75
 # within each weekday and wraps across hour/day boundaries. It does not change
 # any optimizer logic — only the input load series.
 CONSUMPTION_SMOOTH_SLOTS = 3   # 3 = ±1 slot (45-min window); 5 = ±2; 1 = off
+
+# ── Temperature-dependent AC adjustment (2026.06.10l) ──────────────────────
+# On hot days the apartment draws extra power for cooling. The historical
+# consumption profile ALREADY contains the AC load of whatever the temperature
+# was on the past sample days, so we must NOT simply "add AC because it is hot":
+# that double-counts. Instead we adjust by the *cooling-degree difference*
+# between the forecast day and the historical sample days, per hour:
+#
+#   CDD(T)   = max(0, T - AC_BASE_TEMP_C)              (cooling degrees)
+#   ΔCDD(H)  = CDD(T_forecast(H)) - mean_k CDD(T_hist_k(H))
+#   extra_W  = clamp(AC_GAIN_W_PER_CDD * ΔCDD(H), -AC_MAX_BONUS_W, AC_MAX_BONUS_W)
+#   load'(slot in hour H) = max(0, load(slot) + extra_W)
+#
+# Properties: a forecast matching the historical average → no change; hotter
+# than history → load increased; cooler → load DECREASED (correctly removing AC
+# the profile baked in). Cooling-DEGREES (not raw temp) mean mild swings below
+# the base add nothing. Per-HOUR alignment puts the afternoon heat on afternoon
+# slots, not the cool morning. Forecast hourly temps come from Met.no via the
+# weather.get_forecasts service (its hourly forecast is no longer in entity
+# attributes since HA 2024.3); historical temps from InfluxDB (same shape as
+# the consumption query). Applied AFTER smoothing so the AC term is not itself
+# smeared. Any missing data (no forecast / no history) → adjustment skipped for
+# that cycle, base profile used, one rate-limited warning. Tune AC_GAIN to your
+# unit: roughly (AC electrical kW) / (indoor-outdoor ΔT at which it runs flat
+# out) × 1000, but the honest way is to measure — compare a hot day's realised
+# load against a mild day's at the same hours.
+AC_TEMP_ENABLE     = True
+AC_BASE_TEMP_C     = 30.0     # balance point; cooling demand accrues above this
+                              # (this apartment needs cooling only above ~30°C)
+AC_GAIN_W_PER_CDD  = 60.0     # extra watts per °C of cooling-degree DIFFERENCE
+AC_MAX_BONUS_W     = 1500.0   # clamp on |adjustment| so a bad forecast can't explode load
+E_WEATHER          = "weather.forecast_home"   # Met.no entity (hourly forecast)
+INFLUX_TEMP_ENTITY = "outdoor_temperature"     # entity_id tag in InfluxDB
+INFLUX_TEMP_UNIT   = "°C"                       # InfluxDB measurement (unit-named)
+
+# ── Heat-soak / consecutive-day accumulation (2026.06.10m) ─────────────────
+# A single hot day barely warms the building; on the 2nd/3rd consecutive hot
+# day the structure is heat-soaked and the AC works harder for the SAME outdoor
+# temperature. The driver is how well it cools OVERNIGHT: a cool night sheds the
+# stored heat and resets, a warm night carries it forward. We build an
+# accumulation index A from the recent overnight MINIMA (actual nights from
+# InfluxDB) extended by tonight's forecast low, then amplify today's forecast
+# cooling-degrees by (1 + SOAK_GAIN·A). Per the design choice, the heat-soak
+# multiplier rides on the FORECAST term only (it raises today's projected
+# load); the historical baseline is left unamplified. Minor, bounded
+# consequence: a past sample day that was itself heat-soaked already has that
+# AC in the profile, so on such days we slightly over-add — acceptable since
+# heatwaves are the minority and the effect is small.
+#
+#   H(d)      = max(0, night_min(d) - NIGHT_RESET_C)     # nightly heat input
+#   A         = Σ over nights, decayed:  A = A·SOAK_DECAY + H(d)
+#   soak_mult = 1 + SOAK_GAIN · A                        # ≥ 1
+#   extra_W(h)= clamp( AC_GAIN_W_PER_CDD ·
+#                      (soak_mult·CDD(T_fc(h)) - CDD(T_hist(h))), ±AC_MAX_BONUS_W )
+#
+# Day 1 of heat (cool prior nights) → A≈0, soak_mult≈1 (mild, short cooling
+# just above base). Day 3 with warm nights → A grows, soak_mult >1 (same
+# afternoon temp draws more). A cool night decays A → building resets.
+AC_HEAT_SOAK_ENABLE = True
+NIGHT_RESET_C       = 20.0   # overnight min at/below this lets the building reset
+SOAK_DECAY          = 0.5    # fraction of yesterday's accumulation carried over
+SOAK_GAIN           = 0.04   # amplification per unit of accumulated heat index.
+                              # CALIBRATION NOTE: with SOAK_DECAY 0.5 the steady
+                              # accumulator for nights ΔT above reset saturates at
+                              # A_max≈2·ΔT, so soak_mult_max≈1+SOAK_GAIN·2·ΔT. At
+                              # 0.04 and warm 24°C nights (ΔT=4) that is ≈1.32 on a
+                              # sustained heatwave, ≈1.16 after one warm night — a
+                              # moderate, realistic boost. 0.15 would DOUBLE the AC
+                              # term on a heatwave; tune to your building, measure
+                              # if you can (compare day-3 vs day-1 afternoon load
+                              # at equal outdoor temperature).
+SOAK_LOOKBACK_DAYS  = 3      # recent ACTUAL nights pulled from InfluxDB
+# Night window (local hours) over which the overnight minimum is taken.
+NIGHT_HOUR_START    = 22     # 22:00 …
+NIGHT_HOUR_END      = 7      # … 07:00 next morning
 
 # SOC safety ceiling for GRID charging (not PV). Physical protection only — the
 # economics are handled by the objective. ENFORCED since 2026.06.10 as a linear
@@ -486,6 +561,194 @@ async def _influx_query(q: str, session: aiohttp.ClientSession) -> dict:
         return await resp.json(content_type=None)
 
 
+async def _fetch_historical_hourly_temp(session) -> dict:
+    """Return {(weekday, hour): mean_outdoor_C} averaged over the same past
+    same-weekday days the consumption profile uses (4 weeks back, today + 2).
+    Mirrors the consumption query shape. Empty dict on any failure."""
+    now   = datetime.now(TZ)
+    today = now.date()
+    accum: dict = {}
+    weekdays_done = []
+    for day_offset in range(0, 3):
+        target = today + timedelta(days=day_offset)
+        wd     = target.weekday()
+        if wd in weekdays_done:
+            continue
+        weekdays_done.append(wd)
+        for week_back in range(1, 5):
+            sample_day = target - timedelta(weeks=week_back)
+            day_start  = datetime(sample_day.year, sample_day.month,
+                                  sample_day.day, 0, 0, 0, tzinfo=TZ)
+            day_end    = day_start + timedelta(days=1)
+            s_utc = day_start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            e_utc = day_end.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            q = (
+                f'SELECT mean("value") FROM "{INFLUX_TEMP_UNIT}" '
+                f"WHERE \"entity_id\" = '{INFLUX_TEMP_ENTITY}' "
+                f"AND time >= '{s_utc}' AND time < '{e_utc}' "
+                f"GROUP BY time(1h) fill(previous)"
+            )
+            try:
+                data   = await _influx_query(q, session)
+                series = data.get("results", [{}])[0].get("series", [])
+                if not series:
+                    continue
+                cols  = series[0]["columns"]
+                t_idx = cols.index("time"); m_idx = cols.index("mean")
+                for row in series[0].get("values", []):
+                    if row[m_idx] is None:
+                        continue
+                    t_local = datetime.fromisoformat(
+                        row[t_idx].replace("Z", "+00:00")).astimezone(TZ)
+                    accum.setdefault((wd, t_local.hour), []).append(float(row[m_idx]))
+            except Exception as exc:
+                _warn("temp_hist", f"Temp history query error (wd {wd}, -{week_back}w): {exc}")
+    return {k: sum(v) / len(v) for k, v in accum.items() if v}
+
+
+async def _fetch_forecast_hourly_temp() -> dict:
+    """Return {datetime(hour-truncated, TZ): forecast_C} from Met.no via the
+    weather.get_forecasts service (hourly). Since HA 2024.3 the hourly forecast
+    is only available through this service, not entity attributes. Empty dict on
+    any failure."""
+    out: dict = {}
+    try:
+        # pyscript exposes services as callable functions; weather.get_forecasts
+        # returns response data when called with return_response=True. (Since HA
+        # 2024.3 the hourly forecast is only available via this service, not via
+        # entity attributes.)
+        resp = await weather.get_forecasts(
+            entity_id=E_WEATHER, type="hourly",
+            blocking=True, return_response=True,
+        )
+        # resp is keyed by entity_id → {"forecast": [ {datetime, temperature, …}, … ]}
+        entry = (resp or {}).get(E_WEATHER, {})
+        for fc in entry.get("forecast", []):
+            t_raw = fc.get("datetime")
+            temp  = fc.get("temperature")
+            if t_raw is None or temp is None:
+                continue
+            t = datetime.fromisoformat(str(t_raw))
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=timezone.utc)
+            t = t.astimezone(TZ).replace(minute=0, second=0, microsecond=0)
+            out[t] = float(temp)
+    except Exception as exc:
+        _warn("temp_forecast", f"Met.no forecast fetch failed: {exc}")
+    return out
+
+
+async def _fetch_recent_night_minima(session) -> dict:
+    """Return {date: overnight_min_C} for the last SOAK_LOOKBACK_DAYS nights from
+    InfluxDB actuals. A 'night' spanning NIGHT_HOUR_START→NIGHT_HOUR_END (e.g.
+    22:00→07:00) is attributed to the date it ENDS on (the morning). Empty on
+    failure."""
+    now   = datetime.now(TZ)
+    out: dict = {}
+    for back in range(1, SOAK_LOOKBACK_DAYS + 1):
+        morning = (now - timedelta(days=back - 1)).date()   # night ending this morning
+        # window = previous day NIGHT_HOUR_START → this morning NIGHT_HOUR_END
+        start_local = datetime(morning.year, morning.month, morning.day,
+                               0, 0, tzinfo=TZ) - timedelta(days=1) \
+                      + timedelta(hours=NIGHT_HOUR_START)
+        end_local   = datetime(morning.year, morning.month, morning.day,
+                               NIGHT_HOUR_END, 0, tzinfo=TZ)
+        s_utc = start_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        e_utc = end_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        q = (
+            f'SELECT min("value") FROM "{INFLUX_TEMP_UNIT}" '
+            f"WHERE \"entity_id\" = '{INFLUX_TEMP_ENTITY}' "
+            f"AND time >= '{s_utc}' AND time < '{e_utc}'"
+        )
+        try:
+            data   = await _influx_query(q, session)
+            series = data.get("results", [{}])[0].get("series", [])
+            if not series:
+                continue
+            cols = series[0]["columns"]; m_idx = cols.index("min")
+            vals = series[0].get("values", [])
+            if vals and vals[0][m_idx] is not None:
+                out[morning] = float(vals[0][m_idx])
+        except Exception as exc:
+            _warn("night_min", f"Night-min query error (-{back}d): {exc}")
+    return out
+
+
+def _forecast_tonight_min(fc_temp: dict) -> float:
+    """Overnight minimum of TONIGHT from the hourly forecast (NIGHT_HOUR_START
+    tonight → NIGHT_HOUR_END tomorrow). Returns None if not covered."""
+    now = datetime.now(TZ)
+    start = now.replace(hour=NIGHT_HOUR_START, minute=0, second=0, microsecond=0)
+    if now.hour < NIGHT_HOUR_END:
+        # we are already in the small hours: tonight's window started yesterday
+        start -= timedelta(days=1)
+    end = (start + timedelta(days=1)).replace(hour=NIGHT_HOUR_END)
+    mins = [t_c for dt, t_c in fc_temp.items() if start <= dt < end]
+    return min(mins) if mins else None
+
+
+def _heat_soak_multiplier(night_minima: dict, tonight_min) -> float:
+    """Accumulate the heat-soak index over recent actual nights (oldest→newest)
+    plus tonight's forecast, then return soak_mult = 1 + SOAK_GAIN·A. With no
+    data, returns 1.0 (no amplification)."""
+    if not AC_HEAT_SOAK_ENABLE:
+        return 1.0
+    def _h(tmin):
+        return max(0.0, tmin - NIGHT_RESET_C)
+    # ordered list of (date, min) oldest→newest from actuals, then tonight
+    nights = sorted(night_minima.items())          # [(date, min), …] oldest first
+    seq = [v for _, v in nights]
+    if tonight_min is not None:
+        seq.append(tonight_min)
+    if not seq:
+        return 1.0
+    A = 0.0
+    for tmin in seq:
+        A = A * SOAK_DECAY + _h(tmin)
+    mult = 1.0 + SOAK_GAIN * A
+    _dbg(f"Heat-soak: {len(seq)} nights, A={A:.1f}, soak_mult={mult:.2f}")
+    return mult
+
+
+def _apply_ac_adjustment(profile: dict, hist_temp: dict, fc_temp: dict,
+                         soak_mult: float = 1.0) -> dict:
+    """Adjust the (weekday, hour, quarter) consumption profile by the per-hour
+    cooling-degree DIFFERENCE between the forecast and the historical sample
+    days. See the constant block for the rationale (avoids double-counting the
+    AC already baked into the historical profile). Returns a NEW dict. If the
+    needed temperature data is absent the profile is returned unchanged."""
+    if not AC_TEMP_ENABLE or not profile or not fc_temp or not hist_temp:
+        return profile
+
+    def _cdd(t):
+        return max(0.0, t - AC_BASE_TEMP_C)
+
+    # Map forecast datetimes onto (weekday, hour) so they align with the profile.
+    fc_by_wh = {}
+    for dt, t in fc_temp.items():
+        fc_by_wh[(dt.weekday(), dt.hour)] = t
+
+    out = dict(profile)
+    n_adj = 0
+    for (wd, h, q), base in profile.items():
+        tf = fc_by_wh.get((wd, h))
+        th = hist_temp.get((wd, h))
+        if tf is None or th is None:
+            continue
+        # Heat-soak amplifies the FORECAST cooling-degrees only (raises today's
+        # projected load); the historical baseline term is left unamplified.
+        d_cdd  = soak_mult * _cdd(tf) - _cdd(th)
+        extra  = AC_GAIN_W_PER_CDD * d_cdd
+        extra  = max(-AC_MAX_BONUS_W, min(AC_MAX_BONUS_W, extra))
+        out[(wd, h, q)] = max(0.0, base + extra)
+        if abs(extra) > 1.0:
+            n_adj += 1
+    _dbg(f"AC adjustment applied to {n_adj} slots "
+         f"(base {AC_BASE_TEMP_C:.0f}°C, gain {AC_GAIN_W_PER_CDD:.0f} W/°C, "
+         f"soak_mult {soak_mult:.2f})")
+    return out
+
+
 def _smooth_consumption_profile(profile: dict) -> dict:
     """Centered moving average of the (weekday, hour, quarter)-keyed consumption
     profile along the time axis, within each weekday, wrapping across hour and
@@ -593,6 +856,28 @@ async def _fetch_historical_consumption(session: aiohttp.ClientSession) -> dict:
                          int(CONSUMPTION_QUANTILE * (len(sorted_vals) - 1))))
         result[k] = sorted_vals[idx]
 
+    # Temperature-dependent AC adjustment (2026.06.10l), BEFORE smoothing so the
+    # per-hour cooling-degree steps get softened into realistic ramps. Needs
+    # both historical (InfluxDB) and forecast (Met.no) hourly temps; if either
+    # is unavailable the profile is returned unchanged.
+    if AC_TEMP_ENABLE:
+        try:
+            hist_temp = await _fetch_historical_hourly_temp(session)
+            fc_temp   = await _fetch_forecast_hourly_temp()
+            if hist_temp and fc_temp:
+                # Heat-soak multiplier from recent actual nights + tonight forecast.
+                soak_mult = 1.0
+                if AC_HEAT_SOAK_ENABLE:
+                    night_min   = await _fetch_recent_night_minima(session)
+                    tonight_min = _forecast_tonight_min(fc_temp)
+                    soak_mult   = _heat_soak_multiplier(night_min, tonight_min)
+                result = _apply_ac_adjustment(result, hist_temp, fc_temp, soak_mult)
+            else:
+                _warn("ac_temp_data",
+                      "AC adjustment skipped: missing temp history or forecast")
+        except Exception as exc:
+            _warn("ac_temp", f"AC adjustment error: {exc}")
+
     if CONSUMPTION_SMOOTH_SLOTS > 1:
         result = _smooth_consumption_profile(result)
 
@@ -600,7 +885,7 @@ async def _fetch_historical_consumption(session: aiohttp.ClientSession) -> dict:
     _dbg(
         f"Consumption profile rebuilt: weekdays {weekdays_done}, "
         f"{len(result)} slots, q{int(CONSUMPTION_QUANTILE * 100)}, "
-        f"smooth={CONSUMPTION_SMOOTH_SLOTS} (cached for today)"
+        f"smooth={CONSUMPTION_SMOOTH_SLOTS}, ac={AC_TEMP_ENABLE} (cached for today)"
     )
     return result
 
