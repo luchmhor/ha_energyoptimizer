@@ -6,7 +6,7 @@ cost optimizer plans 15-minute slots over up to 48 h; a fast tactical
 controller executes the plan against real measured grid flow; a Plotly
 dashboard card shows history, the live plan and the price curve in one chart.
 
-**Current version: v2026.06.10k** — the strategy file and the tactical
+**Current version: v2026.06.10m** — the strategy file and the tactical
 automation are version-locked and must always be deployed as a pair.
 
 ---
@@ -152,7 +152,7 @@ Restart HA after adding helpers / recorder changes.
 5. Verify the **load banner** in the HA log — exactly one line:
 
    ```
-   energy_optimizer v2026.06.10k loaded (quiet logging: VERBOSE=False, LOG_DEBUG=False)
+   energy_optimizer v2026.06.10m loaded (quiet logging: VERBOSE=False, LOG_DEBUG=False)
    ```
 
    Two banners with different versions = a duplicate copy is loaded.
@@ -225,6 +225,8 @@ stale by design).
 | `GRID_CHARGE_SOC_CEILING_PCT` | 95 | Grid charging may never push SOC above this (enforced in the LP **and** in real time by the tactical layer). PV may still fill to 98 %. |
 | `CONSUMPTION_QUANTILE` | 0.75 | Per-slot quantile of the 4 same-weekday history samples. Conservative high-side; set 0.5 to A/B the over-banking bias. |
 | `CONSUMPTION_SMOOTH_SLOTS` | 3 | Centered moving-average window (odd) over the consumption profile, calming the few-sample sawtooth that caused strategy flip-flop. 1 = off. |
+| `AC_TEMP_ENABLE` / `AC_BASE_TEMP_C` / `AC_GAIN_W_PER_CDD` / `AC_MAX_BONUS_W` | on / 30 / 60 / 1500 | Temperature-dependent AC load adjustment by cooling-degree difference (Met.no forecast vs InfluxDB history). Base 30 °C. Tune the gain to your AC; measure if possible. |
+| `AC_HEAT_SOAK_ENABLE` / `NIGHT_RESET_C` / `SOAK_DECAY` / `SOAK_GAIN` | on / 20 / 0.5 / 0.04 | Consecutive-day heat-soak: warm nights accumulate and amplify the AC term; a cool night resets it. `SOAK_GAIN` is the key knob (≈×1.3 on a heatwave). |
 | `SOC_CRITICAL_PCT` / `SOC_RECOVER_PCT` | 12 / 15 | Emergency HOLD latch with hysteresis; auto-replans on recovery. |
 | `HISTORY_RETENTION_DAYS` | 0 | > 0 prunes daily history files older than N days each night. 0 = keep forever. |
 | `VERBOSE` / `LOG_DEBUG` | False / False | See *Logging* below. |
